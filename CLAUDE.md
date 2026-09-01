@@ -5,10 +5,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project status
 
 This is a CS370 lab implementing a red-black tree in C. `include/rbtree.h` is the frozen
-contract; `src/rbtree.c`, `src/pool.c`, and everything in `tests/` are currently empty
-skeleton files waiting to be implemented. `NOTES.md` contains the assignment spec, the
-design decisions already made, and constraints that must not be violated — read it before
-writing any code here.
+contract. `NOTES.md` contains the assignment spec, the design decisions already made
+(including a devlog of the NIL/parent-pointer/teardown reasoning), and constraints that must
+not be violated — read it before writing any code here.
+
+Current state of `src/rbtree.c`: `rb_create`, the node/tree structs (with parent pointer),
+the `rb_malloc`/`rb_free` seam, and a NULL-safe `rb_destroy` stub (handles `NULL` and
+already-empty trees only) are implemented. `rb_find` and `rb_size` have honest stand-in
+bodies — `rb_size` is already fully correct, `rb_find` unconditionally returns `NULL` pending
+real BST search. `rb_insert`, `rb_foreach`, `rb_validate`, and the real (non-recursive)
+`rb_destroy` teardown are not yet written. `src/pool.c`, `tests/fuzz.c` (beyond a linkable
+placeholder `main`), and `tests/fault_alloc.c` remain empty — out of scope until their
+respective milestones/mutations. `tests/test_rbtree.c` currently covers only the empty-tree
+and `rb_destroy(NULL)` cases.
 
 ## Build and test commands
 
@@ -36,33 +45,35 @@ done — the spec requires zero findings across the whole suite, including the e
   an existing key frees the old value (the tree is its sole owner at that instant) before
   installing the new one. Every allocation has exactly one owner at all times.
 - **Allocation seam**: all allocation in `src/rbtree.c` routes through two 4-line wrappers,
-  `rb_malloc`/`rb_free`, which just forward to `malloc`/`free`. `rb_create_pooled` is a second
-  constructor whose node storage is drawn from an internal slab pool (`src/pool.c`).
+  `rb_malloc`/`rb_free`, which just forward to `malloc`/`free`. This is the optional tip from
+  the spec (not a hard requirement) — it pays off in the next assignment, where a test harness
+  makes allocation fail on demand.
 - **Node shape**: nodes carry a parent pointer (a deliberate design choice beyond the bare
-  minimum). Every missing child conceptually points at a black sentinel NIL leaf.
+  minimum). NIL is represented as `NULL`, not a shared sentinel object — a shared sentinel
+  is incompatible with per-node parent pointers (every node with a missing child would claim
+  to be that one sentinel's parent). Every place that needs a node's color must route through
+  a helper that treats `NULL` as black, never dereference `->color` on a pointer that might
+  be `NULL`. Full reasoning in NOTES.md's devlog. Current, actual shape (matches
+  `src/rbtree.c`):
+  ```c
   typedef enum { RED, BLACK } rb_color_t;
   struct rb_node {
-    char *key; /* heap copy; the tree owns it */
-    void *value; /* ownership per the header contract */
-    /* add parent pointer */
-    struct rb_node *left;
-    struct rb_node *right;
-    rb_color_t color;
+      char           *key;    /* heap copy; the tree owns it */
+      void           *value;  /* ownership per the header contract */
+      struct rb_node *parent; /* NULL for the root */
+      struct rb_node *left;
+      struct rb_node *right;
+      rb_color_t      color;
   };
+  ```
 
 - **Rotations own root maintenance**: `rb_validate` must never be responsible for fixing up
   `t->root` — rotations themselves must keep it correct.
 - **Deletion fixup**: implement all cases, including deleting a black node with exactly one
   child, and the mirrored (right-child-of-right-child) symmetry of every fixup case — the
   spec explicitly calls out the mirror image as "the half people forget."
-- **O(1)-space traversal/teardown**: `rb_foreach` and `rb_destroy` must run in O(1) auxiliary
-  space with no recursion (this is Mutation 3; recursion is otherwise permitted this
-  assignment, but the eventual target is non-recursive). The intended technique for teardown
-  is rotating into a right spine while freeing, so the tree's own pointer fields serve as the
-  bookkeeping instead of a call stack or heap-allocated stack — free the child pointer's
-  target only after saving it, never dereference already-freed memory.
-- **Mutation 4 (rb_snapshot)**: O(1) copy-on-write snapshot; returns NULL on allocation
-  failure.
+- **`rb_foreach` / `rb_destroy`**: recursion is permitted for this assignment (spec §9). See
+  "The Reach" below for the ungraded non-recursive teardown.
 - **`rb_validate` invariants** (must detect and report *which* invariant broke):
   1. root is black
   2. no red node has a red child
@@ -75,6 +86,37 @@ done — the spec requires zero findings across the whole suite, including the e
   random insert/find/delete ops against a reference model (sorted array or linked list is
   fine), calling `rb_validate` at least every 100 ops, and must be clean under both asan and
   memcheck.
+
+## The Reach (ungraded)
+
+Non-recursive, O(1)-auxiliary-space teardown is **not required** for this assignment — it carries
+no points (spec §10, "The Reach"). Recursion in `rb_foreach`/`rb_destroy` is explicitly permitted
+here (spec §9); the non-recursive constraint is a preview of the *next* assignment's stack-budget
+requirements, not something this milestone set is graded on. If time allows, the technique is to
+rotate into a right spine while freeing so the tree's own pointer fields serve as the bookkeeping,
+implemented behind a second function and checked against the fuzzer's teardown — see CS370-HW1.pdf
+§10 for the full writeup before attempting it.
+
+## Process requirements / deliverables (spec §7, §15, §17)
+
+These are graded independently of the code and must not be neglected or bulk-generated at the end:
+
+- **Git history**: ≥ 8 meaningful commits tracking the milestones (M0–M3 in the schedule table,
+  spec §5 — `M<n>: <what>` in a commit message names the milestone, not a "Mutation"). A single
+  "final submission" commit is an automatic process-grade of zero.
+- **`PROMPTLOG.md`**: 4–6 annotated episodes (prompt, what came back, your judgment — accepted,
+  rejected, or pushed back on, and why). Must include at least: one plan you revised, one
+  rejected/oversized diff, one tool-output debugging loop (e.g. a valgrind/asan trace fed back
+  verbatim), and one adversarial-review finding you triaged. Raw transcript pastes score nothing —
+  the annotation is the deliverable.
+- **`REFLECTION.md`** (~1 page): where the agent was most/least reliable, one bug it introduced
+  that you caught and how, and what most surprised you as a C newcomer.
+- **Raw session transcripts**: the actual `.jsonl` files under `~/.claude/projects/<project>/`,
+  copied in as-is — not a summary, not `/export`, not retyped. Work in this project's own
+  dedicated directory so the copy is a single `cp` and doesn't pull in unrelated sessions.
+  Transcripts auto-purge after 30 days by default — copy them out periodically.
+- Grading corroborates these against the repo (commits, diffs, test files, line numbers), not
+  against the log's own narrative — a claim with no matching artifact doesn't count.
 
 ## Working style noted in NOTES.md
 
