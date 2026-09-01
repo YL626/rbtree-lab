@@ -95,6 +95,30 @@ We will add the optional seam, rb_malloc and rb_free (routing as seen in contrac
 
 I would like to add a parent pointer. 
 
+**Devlog — design decisions for the BST-without-fixup slice (M1 start):**
+
+1. NIL representation: NULL-as-black, no sentinel node. A shared sentinel is incompatible
+   with per-node parent pointers — every node with a missing child would claim to be that
+   one sentinel's parent, and whichever write happens last silently wins. Per-node private
+   NIL leaves were considered and rejected as double the allocations for zero semantic gain.
+   So: missing child = NULL, and every place that needs a node's color routes through a
+   helper (is_red/is_black) that treats NULL as black, rather than dereferencing ->color
+   directly on a pointer that might be NULL.
+2. Parent pointer: yes, confirmed. Reasoning: the classic iterative fixup loops (insert and
+   delete) walk *up* from the violation toward the root, testing parent/grandparent/uncle
+   or sibling at each step. Without a parent pointer, every fixup call would need an
+   explicit ancestor stack built during the descent. Cost: rotations must repair a third
+   pointer (the child's new parent) in addition to the two child links, and root
+   reassignment must null the new root's parent. Paid once, in the rotation helper.
+3. Non-recursive rb_destroy (the Reach), implemented now instead of deferred: the frozen
+   header already documents rb_destroy as a future "O(1) auxiliary space, no recursion"
+   mutation, and recursion is explicitly permitted this assignment, but the right-spine
+   rotation technique is simple enough to just do now — one teardown path to verify under
+   asan/memcheck instead of two. During teardown, parent pointers are deliberately left
+   stale on rotated nodes: the tree is being unconditionally destroyed and nothing
+   downstream ever reads those pointers again, so maintaining them is writes with no
+   benefit. Documented, scoped exception to "a rotation always fixes up parent pointers."
+
 The mirror image (a right child of a right child, needing a left rotation at the grandparent) is
 the same code with left and right swapped, and it is the half people forget. Do not forget it.
 And it is worth handing this exact sequence to Claude Code in plan mode, asking it to predict each
