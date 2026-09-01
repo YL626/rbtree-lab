@@ -1,4 +1,13 @@
 **Contracts**: 
+
+include/rb_tree.h (the frozen contract)
+rbtree.c implements rb_tree.h
+src/rbtree.c (tree logic, fixups, validate, teardown)
+rb_malloc / rb_free (the optional seam)
+test_rbtree.c + fuzz.c call through rb_tree.h
+tests/test_rbtree.c (the unit tests + the deletion table)
+tests/fuzz.c (driver + reference model)
+
 At every moment, every allocation has exactly one owner, and that owner is responsible for freeing it.
 
 rb_insert is the instructive case.
@@ -69,12 +78,20 @@ teardown.
 plan first, keep the diffs small, verify everything with tools, and merge
 nothing the user cannot explain.
 
+rb_validate must show a failure reason when it breaks a rule.
+
+ fixup must never dereference memory that has already been freed.
+
+account for the deletion case of deleting a black node with exactly one child. 
+
 **Thresholds**: 
 your fuzzer (tests/fuzz.c) performs ≥ 10^5
 random insert/find/delete operations against a reference model (a sorted array or a simple linked list is fine), calling rb_validate
 at least every 100 operations, under both asan and memcheck.
 
 **Choices left to me**: 
+
+We will add the optional seam, rb_malloc and rb_free (routing as seen in contracts)
 
 I would like to add a parent pointer. 
 
