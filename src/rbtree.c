@@ -23,6 +23,9 @@ struct rbtree {
 static void *rb_malloc(size_t n) { return malloc(n); }
 static void  rb_free(void *p)    { free(p); }
 
+static bool is_red(const struct rb_node *n)  { return n != NULL && n->color == RED; }
+static bool is_black(const struct rb_node *n) { return !is_red(n); }
+
 rbtree_t *rb_create(rb_value_free_fn value_free) {
     rbtree_t *t = rb_malloc(sizeof *t);
     if (t == NULL) return NULL;
@@ -40,6 +43,77 @@ void *rb_find(const rbtree_t *t, const char *key) {
         cur = (cmp < 0) ? cur->left : cur->right;
     }
     return NULL;
+}
+
+/* Standard BST rotation, extended to keep parent pointers and t->root
+ * correct — rotations own root maintenance, not rb_validate. */
+static void rotate_left(rbtree_t *t, struct rb_node *x) {
+    struct rb_node *y = x->right;
+    x->right = y->left;
+    if (y->left != NULL) y->left->parent = x;
+    y->parent = x->parent;
+    if (x->parent == NULL)        t->root = y;
+    else if (x == x->parent->left) x->parent->left = y;
+    else                            x->parent->right = y;
+    y->left = x;
+    x->parent = y;
+}
+
+static void rotate_right(rbtree_t *t, struct rb_node *x) {
+    struct rb_node *y = x->left;
+    x->left = y->right;
+    if (y->right != NULL) y->right->parent = x;
+    y->parent = x->parent;
+    if (x->parent == NULL)         t->root = y;
+    else if (x == x->parent->right) x->parent->right = y;
+    else                             x->parent->left = y;
+    y->right = x;
+    x->parent = y;
+}
+
+static void insert_fixup(rbtree_t *t, struct rb_node *z) {
+    /* Invariant: z is red. Loop while z's parent is also red (the only
+     * possible violation after a plain BST insert of a red node). */
+    while (is_red(z->parent)) {
+        struct rb_node *parent = z->parent;
+        struct rb_node *grandparent = parent->parent;
+        if (parent == grandparent->left) {
+            struct rb_node *uncle = grandparent->right;
+            if (is_red(uncle)) {
+                parent->color = BLACK;
+                uncle->color = BLACK;
+                grandparent->color = RED;
+                z = grandparent;
+            } else {
+                if (z == parent->right) {
+                    z = parent;
+                    rotate_left(t, z);
+                    parent = z->parent;
+                }
+                parent->color = BLACK;
+                grandparent->color = RED;
+                rotate_right(t, grandparent);
+            }
+        } else {
+            struct rb_node *uncle = grandparent->left;
+            if (is_red(uncle)) {
+                parent->color = BLACK;
+                uncle->color = BLACK;
+                grandparent->color = RED;
+                z = grandparent;
+            } else {
+                if (z == parent->left) {
+                    z = parent;
+                    rotate_right(t, z);
+                    parent = z->parent;
+                }
+                parent->color = BLACK;
+                grandparent->color = RED;
+                rotate_left(t, grandparent);
+            }
+        }
+    }
+    t->root->color = BLACK;
 }
 
 int rb_insert(rbtree_t *t, const char *key, void *value) {
@@ -77,6 +151,7 @@ int rb_insert(rbtree_t *t, const char *key, void *value) {
     else if (cmp < 0)        parent->left = n;
     else                     parent->right = n;
 
+    insert_fixup(t, n);
     t->size++;
     return 0;
 }
@@ -115,10 +190,42 @@ static void validate_walk(const struct rb_node *n, struct validate_state *st) {
     validate_walk(n->right, st);
 }
 
+static bool has_red_red(const struct rb_node *n) {
+    if (n == NULL) return false;
+    if (is_red(n) && (is_red(n->left) || is_red(n->right))) return true;
+    return has_red_red(n->left) || has_red_red(n->right);
+}
+
+/* Returns the subtree's black-height, or -1 if any root-to-NIL path within it
+ * has already been found to disagree with another. NULL (NIL) contributes a
+ * black-height of 1 by convention; a black node adds 1 on top of its children's
+ * (equal) black-height. */
+static int black_height(const struct rb_node *n) {
+    if (n == NULL) return 1;
+    int lh = black_height(n->left);
+    if (lh == -1) return -1;
+    int rh = black_height(n->right);
+    if (rh == -1) return -1;
+    if (lh != rh) return -1;
+    return lh + (is_black(n) ? 1 : 0);
+}
+
 int rb_validate(const rbtree_t *t) {
-    /* invariants 1 (root black), 2 (no red-red), 3 (equal black-height) are not
-     * checkable yet — colors have no fixup-maintained meaning until fixup exists.
-     * Wired in when insert/delete fixup land. */
+    if (is_red(t->root)) {
+        fprintf(stderr, "rb_validate: invariant 1 violated (root is red)\n");
+        return 1;
+    }
+    if (has_red_red(t->root)) {
+        fprintf(stderr, "rb_validate: invariant 2 violated "
+                         "(a red node has a red child)\n");
+        return 2;
+    }
+    if (black_height(t->root) == -1) {
+        fprintf(stderr, "rb_validate: invariant 3 violated "
+                         "(root-to-NIL paths have differing black-height)\n");
+        return 3;
+    }
+
     struct validate_state st = { .prev_key = NULL, .order_ok = true, .count = 0 };
     validate_walk(t->root, &st);
 

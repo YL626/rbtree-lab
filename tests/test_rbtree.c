@@ -161,6 +161,122 @@ static void test_validate_on_empty_tree(void) {
  * to wait until a real bug (most likely in fixup, later) can manufacture one, which
  * the fuzzer's periodic rb_validate calls are designed to catch when it happens. */
 
+static void test_insert_single_root_is_black(void) {
+    rbtree_t *t = rb_create(NULL);
+    int value = 1;
+    check(rb_insert(t, "only", &value) == 0, "insert single key for root-black test");
+    check(rb_validate(t) == 0, "validate passes on single-node tree (root is black)");
+    rb_destroy(t);
+}
+
+static void test_insert_ascending_triggers_rr_rotation(void) {
+    /* a < b < c inserted in ascending order forces the RR straight-line case
+     * at the root: c (red) under b (red) under a (root, black), uncle NIL.
+     * A left rotation at a must promote b to root. If the rotation forgets to
+     * update t->root, rb_find would search from the stale (demoted) root and
+     * silently miss keys — the stale-root regression. */
+    rbtree_t *t = rb_create(NULL);
+    int va = 1, vb = 2, vc = 3;
+    check(rb_insert(t, "a", &va) == 0, "insert a");
+    check(rb_insert(t, "b", &vb) == 0, "insert b");
+    check(rb_insert(t, "c", &vc) == 0, "insert c (triggers RR rotation at root)");
+    check(rb_find(t, "a") == &va, "find a after RR rotation");
+    check(rb_find(t, "b") == &vb, "find b after RR rotation");
+    check(rb_find(t, "c") == &vc, "find c after RR rotation");
+    check(rb_size(t) == 3, "size is 3 after RR-triggering inserts");
+    check(rb_validate(t) == 0, "validate passes after RR rotation");
+    struct order_ctx ctx = { .count = 0 };
+    rb_foreach(t, collect_key, &ctx);
+    check(ctx.count == 3 && strcmp(ctx.keys[0], "a") == 0 &&
+          strcmp(ctx.keys[1], "b") == 0 && strcmp(ctx.keys[2], "c") == 0,
+          "foreach still in order after RR rotation");
+    rb_destroy(t);
+}
+
+static void test_insert_descending_triggers_ll_rotation(void) {
+    /* Mirror of the RR case: c, b, a inserted descending forces the LL
+     * straight-line case at the root, needing a right rotation at c. */
+    rbtree_t *t = rb_create(NULL);
+    int va = 1, vb = 2, vc = 3;
+    check(rb_insert(t, "c", &vc) == 0, "insert c");
+    check(rb_insert(t, "b", &vb) == 0, "insert b");
+    check(rb_insert(t, "a", &va) == 0, "insert a (triggers LL rotation at root)");
+    check(rb_find(t, "a") == &va, "find a after LL rotation");
+    check(rb_find(t, "b") == &vb, "find b after LL rotation");
+    check(rb_find(t, "c") == &vc, "find c after LL rotation");
+    check(rb_size(t) == 3, "size is 3 after LL-triggering inserts");
+    check(rb_validate(t) == 0, "validate passes after LL rotation");
+    struct order_ctx ctx = { .count = 0 };
+    rb_foreach(t, collect_key, &ctx);
+    check(ctx.count == 3 && strcmp(ctx.keys[0], "a") == 0 &&
+          strcmp(ctx.keys[1], "b") == 0 && strcmp(ctx.keys[2], "c") == 0,
+          "foreach still in order after LL rotation");
+    rb_destroy(t);
+}
+
+static void test_insert_triggers_red_uncle_recolor(void) {
+    /* m, d, t: m is root (black), d and t are its red children (no
+     * violation). Inserting b (< d) creates a red-red violation (b, d) whose
+     * uncle t is red -> Case 1: recolor d,t black, m red, then re-blacken m
+     * since it's root. No rotation needed for this case. */
+    rbtree_t *t = rb_create(NULL);
+    int vm = 1, vd = 2, vtt = 3, vb = 4;
+    check(rb_insert(t, "m", &vm) == 0, "insert m");
+    check(rb_insert(t, "d", &vd) == 0, "insert d");
+    check(rb_insert(t, "t", &vtt) == 0, "insert t");
+    check(rb_insert(t, "b", &vb) == 0, "insert b (triggers red-uncle recolor)");
+    check(rb_find(t, "m") == &vm, "find m after red-uncle recolor");
+    check(rb_find(t, "d") == &vd, "find d after red-uncle recolor");
+    check(rb_find(t, "t") == &vtt, "find t after red-uncle recolor");
+    check(rb_find(t, "b") == &vb, "find b after red-uncle recolor");
+    check(rb_size(t) == 4, "size is 4 after red-uncle-triggering inserts");
+    check(rb_validate(t) == 0, "validate passes after red-uncle recolor");
+    rb_destroy(t);
+}
+
+static void test_insert_triggers_lr_triangle_double_rotation(void) {
+    /* c, a, b: a is c's red left child; b (between a and c) becomes a's red
+     * right child -- a "triangle" on the left side, uncle (c's right, NIL)
+     * black. Needs rotate_left(a) to straighten, then rotate_right(c). */
+    rbtree_t *t = rb_create(NULL);
+    int vc = 1, va = 2, vb = 3;
+    check(rb_insert(t, "c", &vc) == 0, "insert c");
+    check(rb_insert(t, "a", &va) == 0, "insert a");
+    check(rb_insert(t, "b", &vb) == 0, "insert b (triggers LR double rotation)");
+    check(rb_find(t, "a") == &va, "find a after LR rotation");
+    check(rb_find(t, "b") == &vb, "find b after LR rotation");
+    check(rb_find(t, "c") == &vc, "find c after LR rotation");
+    check(rb_size(t) == 3, "size is 3 after LR-triggering inserts");
+    check(rb_validate(t) == 0, "validate passes after LR rotation");
+    struct order_ctx ctx = { .count = 0 };
+    rb_foreach(t, collect_key, &ctx);
+    check(ctx.count == 3 && strcmp(ctx.keys[0], "a") == 0 &&
+          strcmp(ctx.keys[1], "b") == 0 && strcmp(ctx.keys[2], "c") == 0,
+          "foreach still in order after LR rotation");
+    rb_destroy(t);
+}
+
+static void test_insert_triggers_rl_triangle_double_rotation(void) {
+    /* Mirror of LR: a, c, b -- triangle on the right side, needs
+     * rotate_right(c) to straighten, then rotate_left(a). */
+    rbtree_t *t = rb_create(NULL);
+    int va = 1, vc = 2, vb = 3;
+    check(rb_insert(t, "a", &va) == 0, "insert a");
+    check(rb_insert(t, "c", &vc) == 0, "insert c");
+    check(rb_insert(t, "b", &vb) == 0, "insert b (triggers RL double rotation)");
+    check(rb_find(t, "a") == &va, "find a after RL rotation");
+    check(rb_find(t, "b") == &vb, "find b after RL rotation");
+    check(rb_find(t, "c") == &vc, "find c after RL rotation");
+    check(rb_size(t) == 3, "size is 3 after RL-triggering inserts");
+    check(rb_validate(t) == 0, "validate passes after RL rotation");
+    struct order_ctx ctx = { .count = 0 };
+    rb_foreach(t, collect_key, &ctx);
+    check(ctx.count == 3 && strcmp(ctx.keys[0], "a") == 0 &&
+          strcmp(ctx.keys[1], "b") == 0 && strcmp(ctx.keys[2], "c") == 0,
+          "foreach still in order after RL rotation");
+    rb_destroy(t);
+}
+
 static void test_destroy_single_node(void) {
     rbtree_t *t = rb_create(NULL);
     int value = 1;
@@ -206,6 +322,12 @@ int main(void) {
     test_validate_on_descending_insertion_order();
     test_validate_on_scrambled_insertion_order();
     test_validate_on_empty_tree();
+    test_insert_single_root_is_black();
+    test_insert_ascending_triggers_rr_rotation();
+    test_insert_descending_triggers_ll_rotation();
+    test_insert_triggers_red_uncle_recolor();
+    test_insert_triggers_lr_triangle_double_rotation();
+    test_insert_triggers_rl_triangle_double_rotation();
     test_destroy_single_node();
     test_destroy_left_heavy_chain();
     test_destroy_calls_value_free_once_per_node();
