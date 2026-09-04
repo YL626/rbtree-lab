@@ -9,15 +9,24 @@ contract. `NOTES.md` contains the assignment spec, the design decisions already 
 (including a devlog of the NIL/parent-pointer/teardown reasoning), and constraints that must
 not be violated — read it before writing any code here.
 
-Current state of `src/rbtree.c`: `rb_create`, the node/tree structs (with parent pointer),
-the `rb_malloc`/`rb_free` seam, and a NULL-safe `rb_destroy` stub (handles `NULL` and
-already-empty trees only) are implemented. `rb_find` and `rb_size` have honest stand-in
-bodies — `rb_size` is already fully correct, `rb_find` unconditionally returns `NULL` pending
-real BST search. `rb_insert`, `rb_foreach`, `rb_validate`, and the real (non-recursive)
-`rb_destroy` teardown are not yet written. `src/pool.c`, `tests/fuzz.c` (beyond a linkable
-placeholder `main`), and `tests/fault_alloc.c` remain empty — out of scope until their
-respective milestones/mutations. `tests/test_rbtree.c` currently covers only the empty-tree
-and `rb_destroy(NULL)` cases.
+Current state of `src/rbtree.c` (through M1): `rb_create`, `rb_size`, `rb_find` (real BST
+search), `rb_insert` (rotations + fixup, all cases and mirrors), `rb_foreach` (recursive
+in-order), and `rb_validate` (all five invariants, each reporting which one broke) are
+implemented and exercised by both the unit tests and the fuzzer. `rb_destroy` already does
+the *real* teardown, and via the non-recursive "Reach" technique (rotate-into-right-spine)
+from spec §10 even though that's ungraded for this milestone set — it should still be
+diffed against the fuzzer's teardown per NOTES.md before being trusted long-term.
+`tests/test_rbtree.c` has 21 tests covering create/destroy, insert/find/overwrite,
+`rb_foreach` ordering, `rb_validate` on ascending/descending/scrambled insertion, every
+insert-fixup case (RR/LL straight-line, red-uncle recolor, LR/RL triangle) by name, and
+several destroy variants (single node, left-heavy chain, per-node `value_free` count).
+`tests/fuzz.c` is a real insert/find fuzzer against a reference array model, validating
+sizes every op and `rb_validate` every 100 ops.
+
+**Not yet started (next up, M2):** `rb_delete` is declared in the frozen header but has no
+implementation anywhere — no stub, no deletion fixup, no table-driven delete tests, and the
+fuzzer only exercises insert/find so far (no delete ops against the model). `src/pool.c` and
+`tests/fault_alloc.c` remain empty — out of scope until their respective milestones/mutations.
 
 ## Build and test commands
 
