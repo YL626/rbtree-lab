@@ -9,24 +9,24 @@ contract. `NOTES.md` contains the assignment spec, the design decisions already 
 (including a devlog of the NIL/parent-pointer/teardown reasoning), and constraints that must
 not be violated — read it before writing any code here.
 
-Current state of `src/rbtree.c` (through M1): `rb_create`, `rb_size`, `rb_find` (real BST
-search), `rb_insert` (rotations + fixup, all cases and mirrors), `rb_foreach` (recursive
-in-order), and `rb_validate` (all five invariants, each reporting which one broke) are
-implemented and exercised by both the unit tests and the fuzzer. `rb_destroy` already does
-the *real* teardown, and via the non-recursive "Reach" technique (rotate-into-right-spine)
-from spec §10 even though that's ungraded for this milestone set — it should still be
-diffed against the fuzzer's teardown per NOTES.md before being trusted long-term.
-`tests/test_rbtree.c` has 21 tests covering create/destroy, insert/find/overwrite,
-`rb_foreach` ordering, `rb_validate` on ascending/descending/scrambled insertion, every
-insert-fixup case (RR/LL straight-line, red-uncle recolor, LR/RL triangle) by name, and
-several destroy variants (single node, left-heavy chain, per-node `value_free` count).
-`tests/fuzz.c` is a real insert/find fuzzer against a reference array model, validating
-sizes every op and `rb_validate` every 100 ops.
-
-**Not yet started (next up, M2):** `rb_delete` is declared in the frozen header but has no
-implementation anywhere — no stub, no deletion fixup, no table-driven delete tests, and the
-fuzzer only exercises insert/find so far (no delete ops against the model). `src/pool.c` and
+Current state of `src/rbtree.c`: `rb_create`, the node/tree structs (with parent pointer),
+the `rb_malloc`/`rb_free` seam, `rb_find` (real BST search), `rb_size`, `rb_insert` (with
+rotations and insertion fixup, all cases + mirrors), `rb_foreach` (recursive in-order),
+`rb_validate` (all five invariants), and `rb_destroy` are implemented. `rb_destroy` already
+uses the non-recursive "Reach" technique (rotate into a right spine while freeing) — see
+"The Reach" below; it is not just the ungraded future work it's described as there.
+**`rb_delete` (and its fixup, including the mirrored cases) is declared in `include/rbtree.h`
+but not yet defined anywhere in `src/rbtree.c` — this is the current gap.** `src/pool.c` and
 `tests/fault_alloc.c` remain empty — out of scope until their respective milestones/mutations.
+
+`tests/fuzz.c` is implemented (not just a placeholder `main`): it runs insert/find ops against
+a reference-model oracle (an array of key/value pairs), per its own M1 commit — it does not
+yet exercise `rb_delete`, since that function doesn't exist yet. `tests/test_rbtree.c` now
+covers insert/find (including overwrite and missing-key cases), foreach ordering, validate
+(ascending/descending/scrambled/empty), the insertion-fixup rotation cases (LL/RR/LR/RL,
+red-uncle recolor), and destroy (single node, chain, value_free-once) — it does **not** yet
+have the table-driven `rb_delete` tests required by the spec (red leaf, black leaf with red
+sibling, two-child node, root deletion), since `rb_delete` isn't written yet.
 
 ## Build and test commands
 
