@@ -5,8 +5,8 @@
 #include <time.h>
 
 /* Reference model: a flat array of key/value pairs, kept in sync with the
- * tree on every successful insert. Linear scans are fine here — this is a
- * correctness oracle, not something that needs to be fast. */
+ * tree on every successful insert or delete. Linear scans are fine here —
+ * this is a correctness oracle, not something that needs to be fast. */
 struct model_entry {
     char *key;
     int  *value;
@@ -51,6 +51,18 @@ static void model_put(struct model *m, const char *key, int *value) {
     m->count++;
 }
 
+static void model_delete(struct model *m, const char *key) {
+    for (size_t i = 0; i < m->count; i++) {
+        if (strcmp(m->entries[i].key, key) == 0) {
+            free(m->entries[i].key);
+            free(m->entries[i].value);
+            m->entries[i] = m->entries[m->count - 1];
+            m->count--;
+            return;
+        }
+    }
+}
+
 static void model_destroy(struct model *m) {
     for (size_t i = 0; i < m->count; i++) {
         free(m->entries[i].key);
@@ -79,9 +91,9 @@ int main(int argc, char **argv) {
     char keybuf[32];
     for (long op = 0; op < op_count; op++) {
         make_key(keybuf, sizeof keybuf, key_space);
-        int choose_insert = rand() % 2;
+        int op_choice = rand() % 3; /* 0 = insert, 1 = find, 2 = delete */
 
-        if (choose_insert) {
+        if (op_choice == 0) {
             int *value = malloc(sizeof *value);
             if (value == NULL) { fprintf(stderr, "fuzz: value malloc failed\n"); return 1; }
             *value = (int)op;
@@ -99,7 +111,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             model_put(&m, keybuf, value);
-        } else {
+        } else if (op_choice == 1) {
             struct model_entry *e = model_find(&m, keybuf);
             void *found = rb_find(t, keybuf);
             if (e == NULL) {
@@ -112,6 +124,28 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "fuzz: rb_find value mismatch at op %ld (key=%s)\n",
                         op, keybuf);
                 return 1;
+            }
+        } else {
+            struct model_entry *e = model_find(&m, keybuf);
+            int rc = rb_delete(t, keybuf);
+            if (e == NULL) {
+                if (rc != -1) {
+                    fprintf(stderr, "fuzz: rb_delete succeeded on an absent key "
+                                     "at op %ld (key=%s)\n", op, keybuf);
+                    return 1;
+                }
+            } else {
+                if (rc != 0) {
+                    fprintf(stderr, "fuzz: rb_delete failed on a key the model has "
+                                     "at op %ld (key=%s)\n", op, keybuf);
+                    return 1;
+                }
+                model_delete(&m, keybuf);
+                if (rb_find(t, keybuf) != NULL) {
+                    fprintf(stderr, "fuzz: key still findable after rb_delete "
+                                     "at op %ld (key=%s)\n", op, keybuf);
+                    return 1;
+                }
             }
         }
 
@@ -139,6 +173,6 @@ int main(int argc, char **argv) {
     rb_destroy(t);
     model_destroy(&m);
 
-    printf("fuzz: %ld insert/find ops OK\n", op_count);
+    printf("fuzz: %ld insert/find/delete ops OK\n", op_count);
     return 0;
 }

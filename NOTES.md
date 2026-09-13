@@ -102,6 +102,8 @@ panel before you scroll, because arguing about 35 for ten minutes now is conside
 discovering at the walkthrough that you learned deletion fixup and merely memorized this.
 FIGURE 4
 
+We decided to extend the fuzzer to include case 3, where we need an extended fixup to climb up the tree. There was a gap in coverage. This also was to cover the fact that the 9 table-driven cases we came up with did not exercse a multi-level delete_fixup climb (case 3 recoloring and moving up more than one ancestor) or a debt that climbs up to the root. 
+
 
 
 
@@ -309,3 +311,5 @@ Self-tests before moving on(for rb_destroy):
     real tree rotation, on purpose. What invariant does a real rotation preserve that this one
     is explicitly allowed to ignore, and why, given the earlier "leave parent pointers stale
     during teardown" decision?)
+
+   
