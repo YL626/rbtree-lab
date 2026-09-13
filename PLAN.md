@@ -156,9 +156,171 @@ produce a genuinely RED immediate sibling:
 - **Mirror:** insert `p,n,l,k,c,i,e`; delete `p`. `p` is a black leaf, sibling `k` is RED on
   the *left*, forcing the mirrored rotation direction.
 
+## Status of the STEP 0+1 slice above
+
+**Approved and implemented.** `find_node`, `tree_min`, `transplant`, and `rb_delete`'s STEP0/1
+body are committed (`f32e9ef`). 7 of 9 table cases pass; the two "black leaf with red sibling"
+cases (now using the corrected `c,b,d,f,g,l,n`/`p,n,l,k,c,i,e` sequences, also committed) fail
+`rb_validate` exactly as expected, because STEP 2 doesn't exist yet. This is the current gap.
+
+---
+
+# STEP 2: doubly-black fixup loop (this planning round)
+
+## Why now
+
+This is the only remaining gap in `rb_delete`. Without it, deleting any black leaf whose
+removal doesn't get absorbed by STEP 1's trivial one-child recolor corrupts invariant 3
+(black-height) -- exactly the 2 failing table cases, and (once the fuzzer is extended to call
+`rb_delete`, a separate follow-up) any fuzzer run that deletes a black leaf.
+
+## The core design problem: `x` can be NULL, and NULL can't hold its own parent
+
+CLRS's classic delete-fixup relies on a mutable sentinel NIL node so the deficient node `x`
+always has a real `x->parent` to read. This tree deliberately has **no sentinel** (NIL ==
+`NULL`), specifically because a shared sentinel is incompatible with per-node parent pointers
+(every node with a missing child would claim to be that one sentinel's parent) -- an explicit,
+already-committed design decision from NOTES.md's devlog.
+
+The fix: thread `x` and its parent through the loop as an explicit **pair**, `(parent, x)`,
+instead of ever reading `x->parent`. `rotate_left`/`rotate_right` (already in `rbtree.c`,
+lines ~51-73) are reused unchanged.
+
+## `delete_fixup` (verified design -- independently reviewed, see below)
+
+```c
+static void delete_fixup(rbtree_t *t, struct rb_node *parent, struct rb_node *x) {
+    while (parent != NULL && is_black(x)) {
+        if (x == parent->left) {
+            struct rb_node *sib = parent->right;
+            if (is_red(sib)) {                      /* Case 5: sibling red */
+                sib->color = BLACK;
+                parent->color = RED;
+                rotate_left(t, parent);
+                sib = parent->right;
+            }
+            if (is_black(sib->left) && is_black(sib->right)) {  /* Case 3: both nephews black */
+                sib->color = RED;
+                x = parent;
+                parent = x->parent;
+            } else {
+                if (is_black(sib->right)) {          /* near red / far black: convert first */
+                    if (sib->left != NULL) sib->left->color = BLACK;
+                    sib->color = RED;
+                    rotate_right(t, sib);
+                    sib = parent->right;
+                }
+                sib->color = parent->color;          /* Case 4: far nephew red, terminal */
+                parent->color = BLACK;
+                if (sib->right != NULL) sib->right->color = BLACK;
+                rotate_left(t, parent);
+                return;
+            }
+        } else {
+            /* exact mirror: left/right swapped, rotate_right/rotate_left swapped */
+            struct rb_node *sib = parent->left;
+            if (is_red(sib)) {
+                sib->color = BLACK;
+                parent->color = RED;
+                rotate_right(t, parent);
+                sib = parent->left;
+            }
+            if (is_black(sib->left) && is_black(sib->right)) {
+                sib->color = RED;
+                x = parent;
+                parent = x->parent;
+            } else {
+                if (is_black(sib->left)) {
+                    if (sib->right != NULL) sib->right->color = BLACK;
+                    sib->color = RED;
+                    rotate_left(t, sib);
+                    sib = parent->left;
+                }
+                sib->color = parent->color;
+                parent->color = BLACK;
+                if (sib->left != NULL) sib->left->color = BLACK;
+                rotate_right(t, parent);
+                return;
+            }
+        }
+    }
+    if (x != NULL) x->color = BLACK;
+}
+```
+
+Style note: mirrors `insert_fixup`'s shape exactly (one function, if/else mirror branch, no
+separate mirrored function) -- same precedent already established in this file.
+
+## Integration point in `rb_delete`
+
+Replace the current deferred comment (lines ~207-211):
+```c
+    if (n_was_black && child != NULL) {
+        child->color = BLACK;
+    }
+    /* else if (n_was_black): doubly-black black-leaf case -- STEP2 fixup
+     * loop deferred to a later slice. */
+```
+with:
+```c
+    if (n_was_black) {
+        if (child != NULL) {
+            child->color = BLACK;                 /* STEP1: absorbs the debt locally */
+        } else {
+            delete_fixup(t, n->parent, NULL);      /* STEP2: only after transplant has run */
+        }
+    }
+```
+Nothing else in `rb_delete` changes. `n->parent` is safe to pass here specifically because
+`transplant(t, n, child)` (already called just above) has by this point already overwritten
+`n->parent`'s child-slot pointer (`->left` or `->right`) to hold `child` (i.e. `NULL`) --
+so `delete_fixup`'s very first comparison, `x == parent->left`, correctly resolves which side
+is deficient even though `x` is `NULL`, with no extra bookkeeping.
+
+## Independent review (Plan sub-agent, fresh read of the actual code/NOTES.md)
+
+Checked and confirmed:
+- **Mirror correctness**: every left/right and `rotate_left`/`rotate_right` pairing verified
+  swapped consistently; the one detail people usually get backwards (which nephew is "far") is
+  correct in both branches.
+- **`sib` is never NULL** when dereferenced: proven from the black-height invariant (a doubly-
+  black `x`'s side owes 2+ black-height, so by invariant 3 `sib`'s subtree must also carry
+  black-height >=2, which `NULL` (bh 1) can't satisfy) -- not just asserted.
+- **Termination**: Case 5 falls through into the same iteration (no bug); Case 4 always
+  `return`s; Case 3 is the only path that re-loops, and it strictly climbs one level each time,
+  bounded by the root.
+- **No use-after-free**: `delete_fixup` runs before `n` itself is freed in `rb_delete`, and
+  never touches `n`.
+- Hand-traced both real table fixtures end-to-end:
+  - `c,b,d,f,g,l,n` / delete `b`: Case 5 (sibling `f` red) -> rotate+swap -> Case 3 (new
+    sibling `d`, both children black) -> recolor `d` red, climb to old-parent `c`, `c` was
+    reddened by the Case-5 swap so the loop exits immediately -> `c` forced black. Final tree
+    balanced, matches the expected Case5->Case3a chain from NOTES.md.
+  - `p,n,l,k,c,i,e` / delete `p`: exact mirror image of the above (`k`<->`f`, `e`<->`l`,
+    `n`<->`c`, `i`<->`d`), same Case5(mirror)->Case3(mirror) chain, same clean termination.
+    (One transcription slip on my part fed the reviewing sub-agent a garbled version of this
+    fixture that looked invariant-violating -- re-checked directly against the actual
+    committed test sequence and the tree is valid; the design and the real fixture are both
+    fine.)
+
+No correctness bugs found. One documentation-only nit taken: the integration comment now says
+the call must happen *after* `transplant` has run (the load-bearing fact), not that `n->parent`
+must be *read* after `transplant` (which is true but not why it matters -- `transplant` never
+writes `n->parent` itself, only `n->parent`'s child-slot).
+
+## Verification plan (post-approval)
+
+1. `make test` -- expect all 9 table-driven `rb_delete` cases green, plus the rest of the
+   existing suite unaffected.
+2. `make asan`, `make memcheck` -- clean, including the empty-tree case.
+3. Out of scope for *this* slice, flagged as an immediate follow-up: `tests/fuzz.c` doesn't
+   exercise `rb_delete` yet (per CLAUDE.md project status, "since that function doesn't exist
+   yet") -- now that it will, extending the fuzzer to interleave delete ops against the
+   reference model is the natural next task, but it's a separate change to a different file
+   and gets its own approval pass rather than riding in on this one.
+
 ## Open items before implementation begins
 
-1. Approve or revise the pseudocode above.
-2. Approve or revise the two corrected test sequences (edit to `tests/test_rbtree.c`).
-3. Confirm slice boundary (stop before STEP2) is acceptable, i.e. it's fine for 2 of 9 table
-   tests to remain red after this slice lands, pending the next slice.
+1. Approve the `delete_fixup` design and integration point above.
+2. Confirm the fuzzer extension is deliberately out of scope for this slice (separate
+   follow-up), not something to fold in silently.

@@ -181,6 +181,68 @@ static void transplant(rbtree_t *t, struct rb_node *u, struct rb_node *v) {
     else                            u->parent->right = v;
 }
 
+/* x may be NULL (NIL); since NULL can't carry its own parent pointer,
+ * (parent, x) is threaded through the loop as an explicit pair instead
+ * of ever reading x->parent -- see NOTES.md's devlog on why this tree
+ * has no shared sentinel. */
+static void delete_fixup(rbtree_t *t, struct rb_node *parent, struct rb_node *x) {
+    while (parent != NULL && is_black(x)) {
+        if (x == parent->left) {
+            struct rb_node *sib = parent->right;
+            if (is_red(sib)) {                     /* Case 5: sibling red */
+                sib->color = BLACK;
+                parent->color = RED;
+                rotate_left(t, parent);
+                sib = parent->right;
+            }
+            if (is_black(sib->left) && is_black(sib->right)) { /* Case 3: both nephews black */
+                sib->color = RED;
+                x = parent;
+                parent = x->parent;
+            } else {
+                if (is_black(sib->right)) {         /* near red / far black: convert first */
+                    if (sib->left != NULL) sib->left->color = BLACK;
+                    sib->color = RED;
+                    rotate_right(t, sib);
+                    sib = parent->right;
+                }
+                sib->color = parent->color;         /* Case 4: far nephew red, terminal */
+                parent->color = BLACK;
+                if (sib->right != NULL) sib->right->color = BLACK;
+                rotate_left(t, parent);
+                return;
+            }
+        } else {
+            /* exact mirror: left/right swapped, rotate_right/rotate_left swapped */
+            struct rb_node *sib = parent->left;
+            if (is_red(sib)) {
+                sib->color = BLACK;
+                parent->color = RED;
+                rotate_right(t, parent);
+                sib = parent->left;
+            }
+            if (is_black(sib->left) && is_black(sib->right)) {
+                sib->color = RED;
+                x = parent;
+                parent = x->parent;
+            } else {
+                if (is_black(sib->left)) {
+                    if (sib->right != NULL) sib->right->color = BLACK;
+                    sib->color = RED;
+                    rotate_left(t, sib);
+                    sib = parent->left;
+                }
+                sib->color = parent->color;
+                parent->color = BLACK;
+                if (sib->left != NULL) sib->left->color = BLACK;
+                rotate_right(t, parent);
+                return;
+            }
+        }
+    }
+    if (x != NULL) x->color = BLACK;
+}
+
 int rb_delete(rbtree_t *t, const char *key) {
     struct rb_node *z = find_node(t, key);
     if (z == NULL) return -1;
@@ -204,11 +266,13 @@ int rb_delete(rbtree_t *t, const char *key) {
     bool n_was_black = is_black(n);
     transplant(t, n, child);
 
-    if (n_was_black && child != NULL) {
-        child->color = BLACK;
+    if (n_was_black) {
+        if (child != NULL) {
+            child->color = BLACK;             /* STEP1: absorbs the debt locally */
+        } else {
+            delete_fixup(t, n->parent, NULL); /* STEP2: only after transplant has run */
+        }
     }
-    /* else if (n_was_black): doubly-black black-leaf case -- STEP2 fixup
-     * loop deferred to a later slice. */
 
     if (free_own_payload) {
         rb_free(n->key);
