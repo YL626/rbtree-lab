@@ -188,6 +188,8 @@ itself). If N is freed early, save whatever pointers the fixup loop needs (P, S,
 N's parent slot) before the free, not after — same rule as the single-child splice
 case, just spread across a whole loop instead of one splice.
 
+**Errors Caught**
+
 **Personal Notes**
 We did not use a shared sentinel due to how every parent with a missing child would claim that that one shared sentinel is their child, when in reality the parent which most recently wrote to it, is the one who is the parent.
 

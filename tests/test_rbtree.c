@@ -309,6 +309,113 @@ static void test_destroy_calls_value_free_once_per_node(void) {
     check(free_count == 5, "value_free called exactly once per node on destroy");
 }
 
+/* ---- rb_delete: table-driven cases ----
+ * Each case builds a tree via a fixed insertion sequence (chosen so the
+ * insertion fixup produces the exact structural situation named), deletes
+ * one key, then asserts rb_delete's return code, rb_size, rb_validate, that
+ * the deleted key is gone, and that every surviving key is still findable.
+ * Mirrored cases are literal left/right mirrors of their sibling case
+ * (mirrored keys), per NOTES.md's decision tree and the spec's explicit
+ * call-out that the mirror is "the half people forget."
+ */
+struct delete_case {
+    const char *name;
+    const char *insert_keys[TEST_MAX_KEYS];
+    int         insert_count;
+    const char *delete_key;
+};
+
+static const struct delete_case delete_cases[] = {
+    /* Red leaf: with keys b,a,c inserted, a and c end up red leaf children
+     * of black root b. Deleting a red leaf needs no fixup at all. */
+    { "delete red leaf", { "b", "a", "c" }, 3, "a" },
+    { "delete red leaf (mirror)", { "b", "a", "c" }, 3, "c" },
+
+    /* Black leaf with red sibling: d,b,f,a,c inserted keeps b and f black
+     * (children of black root d), with a and c red leaves under b. Deleting
+     * f (a black leaf whose sibling b is red... */
+    { "delete black leaf with red sibling",
+      { "d", "b", "f", "a", "c" }, 5, "f" },
+    { "delete black leaf with red sibling (mirror)",
+      { "d", "f", "b", "e", "g" }, 5, "b" },
+
+    /* Node with two children: root has two children; delete the root itself
+     * so the successor-splice path is exercised on the two-children case
+     * generally (also doubles as the "root deletion" requirement). */
+    { "delete node with two children (root)",
+      { "d", "b", "f", "a", "c", "e", "g" }, 7, "d" },
+    { "delete node with two children (non-root)",
+      { "d", "b", "f", "a", "c", "e", "g" }, 7, "f" },
+
+    /* Root deletion, single node: the only node in the tree is the root. */
+    { "delete root (single node tree)", { "only" }, 1, "only" },
+
+    /* Black node with exactly one (red) child: b inserted then a inserted
+     * descending leaves b black with a single red left child a (no fixup
+     * needed for 2 nodes -- b stays black, a is red). Deleting b splices
+     * a into its place. */
+    { "delete black node with one red child (left)",
+      { "b", "a" }, 2, "b" },
+    { "delete black node with one red child (right, mirror)",
+      { "a", "b" }, 2, "a" },
+};
+
+static void run_delete_case(const struct delete_case *c) {
+    rbtree_t *t = rb_create(NULL);
+    int values[TEST_MAX_KEYS] = {0};
+    char msg[256];
+
+    for (int i = 0; i < c->insert_count; i++) {
+        snprintf(msg, sizeof msg, "[%s] insert %s", c->name, c->insert_keys[i]);
+        check(rb_insert(t, c->insert_keys[i], &values[i]) == 0, msg);
+    }
+
+    snprintf(msg, sizeof msg, "[%s] rb_delete(%s) returns 0", c->name, c->delete_key);
+    check(rb_delete(t, c->delete_key) == 0, msg);
+
+    snprintf(msg, sizeof msg, "[%s] size decremented after delete", c->name);
+    check(rb_size(t) == (size_t)(c->insert_count - 1), msg);
+
+    snprintf(msg, sizeof msg, "[%s] rb_validate passes after delete", c->name);
+    check(rb_validate(t) == 0, msg);
+
+    snprintf(msg, sizeof msg, "[%s] deleted key %s no longer found", c->name, c->delete_key);
+    check(rb_find(t, c->delete_key) == NULL, msg);
+
+    for (int i = 0; i < c->insert_count; i++) {
+        if (strcmp(c->insert_keys[i], c->delete_key) == 0) continue;
+        snprintf(msg, sizeof msg, "[%s] surviving key %s still found", c->name, c->insert_keys[i]);
+        check(rb_find(t, c->insert_keys[i]) != NULL, msg);
+    }
+
+    rb_destroy(t);
+}
+
+static void test_delete_table_driven(void) {
+    size_t n = sizeof delete_cases / sizeof delete_cases[0];
+    for (size_t i = 0; i < n; i++) run_delete_case(&delete_cases[i]);
+}
+
+static void test_delete_missing_key_returns_error(void) {
+    rbtree_t *t = rb_create(NULL);
+    int value = 1;
+    check(rb_insert(t, "apple", &value) == 0, "insert apple for missing-key delete test");
+    check(rb_delete(t, "banana") == -1, "rb_delete on absent key returns -1");
+    check(rb_size(t) == 1, "size unchanged after failed delete");
+    check(rb_validate(t) == 0, "validate still passes after failed delete");
+    rb_destroy(t);
+}
+
+static void test_delete_frees_value(void) {
+    free_count = 0;
+    rbtree_t *t = rb_create(counting_free);
+    check(rb_insert(t, "apple", make_int(1)) == 0, "insert apple with heap value");
+    check(rb_delete(t, "apple") == 0, "delete apple");
+    check(free_count == 1, "value_free called exactly once on delete");
+    check(rb_size(t) == 0, "size is 0 after deleting only node");
+    rb_destroy(t);
+}
+
 int main(void) {
     test_create_destroy_empty();
     test_destroy_null_is_safe();
@@ -331,6 +438,9 @@ int main(void) {
     test_destroy_single_node();
     test_destroy_left_heavy_chain();
     test_destroy_calls_value_free_once_per_node();
+    test_delete_table_driven();
+    test_delete_missing_key_returns_error();
+    test_delete_frees_value();
     printf(failures == 0 ? "\nAll tests passed.\n" : "\n%d test(s) FAILED.\n", failures);
     return failures == 0 ? 0 : 1;
 }
