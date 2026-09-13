@@ -108,6 +108,86 @@ FIGURE 4
 
 **Confusions:**
 
+Deletion case key (study aid, from quizzing myself against spec Section 3, pages 11-16
+— rb_delete isn't implemented yet, this is the decision tree to code against):
+
+Every deletion, no matter how it starts, reduces to "unlink a node with at most one child."
+
+STEP 0 — reduce to the base case:
+  - if the node to delete has two children:
+      find its in-order successor Y (leftmost node in its right subtree),
+      copy Y's key/value into the doomed node's slot (the node ITSELF stays in the
+      tree, keeps its own color/pointers — only key/value move),
+      then delete Y instead. Y is guaranteed to have at most one child
+      (it's the leftmost node in a subtree, so no left child).
+  - now you're always unlinking some node N with 0 or 1 children.
+
+STEP 1 — what color is N?
+  if N is RED:
+      -> N must be a leaf (a red node's children are NIL/black-only, and if N had
+         one child that child would be black, which would already break black-height
+         before you touched anything — so a red N can't have exactly one child).
+      -> unlink and free it. No fixup. Black-height on that path never changes.
+      -> DONE. (Case 1: red leaf.)
+
+  if N is BLACK and has exactly one child C:
+      -> C must be RED (same black-height argument, mirrored: a black child there
+         would already have broken invariant 3 before deletion).
+      -> splice C into N's slot, paint C black, free N.
+      -> C now carries exactly the black N used to carry. No debt created.
+      -> DONE, no sibling-based fixup loop should run. (Case 6, Figure 8 — the
+         "side door" case that two-children reduction walks into constantly.)
+
+  if N is BLACK and has zero children (a black leaf):
+      -> the slot left behind is "doubly black" (owes one black node). This is
+         the only case that needs the real fixup loop. Go to STEP 2.
+
+STEP 2 — doubly-black fixup loop (only reached for: black leaf, no children).
+  Look at the doubly-black slot's SIBLING (S) and PARENT (P).
+
+  if S is RED:
+      -> (forces P black, S's children black, by rule 4/5).
+      -> rotate S up over P, swap colors (P <-> S's old color).
+      -> NOTHING is fixed yet — this is a pure reshuffle, no black-height changed
+         anywhere (you rotated a red node, which is free, and only swapped colors
+         1-for-1 between P and S).
+      -> new sibling is now guaranteed BLACK (was S's own child).
+      -> re-run STEP 2 from the top with the new sibling. (Case 5.)
+
+  if S is BLACK and has at least one RED child:
+      -> recoloring is illegal here (painting S red would stack it under its own
+         red child = new red-red violation).
+      -> rotate the red nephew into the deficient side, recolor on arrival so the
+         relocated red node becomes the missing black.
+      -> TERMINAL. Debt fully paid in this one step, regardless of P's color.
+         Never climbs further. (Case 4.)
+
+  if S is BLACK and both children are BLACK/NIL:
+      -> no red material anywhere nearby to rotate with — rotating black nodes
+         here only moves an existing black around, it can't manufacture a new one.
+      -> recolor S red (strips a black from S's branch too, so both branches under
+         P now agree, both one-short) then:
+         if P is RED: recolor P black. P absorbs the shared debt. DONE. (Case 3a,
+            the deletion-twin of insert's red-uncle case — 2 recolors, 0 rotations.)
+         if P is BLACK: nothing absorbs the debt. The doubly-black marker moves up
+            to P. Re-run STEP 2 with P's slot as the new deficient node. (Case 3b —
+            this is the case that climbs, possibly to the root.)
+
+  if the debt climbs all the way to the root: it just disappears — a root with
+  no black debt above it needs nothing further, black-height simply dropped by one
+  uniformly, which is legal (invariant 3 only requires paths to AGREE, not a fixed
+  absolute count).
+
+Mirror image reminder: every "left/right" in the above has a mirror where sibling
+hangs off the other side. Do not forget it — same bug shape as insert fixup's
+LR/RL mirror, and the spec calls it "the half people forget" a second time here.
+
+Memory-safety trap specific to this loop: N (the physically unlinked node) is often
+freed BEFORE the fixup loop runs (fixup only needs P/S/N's old position, not N
+itself). If N is freed early, save whatever pointers the fixup loop needs (P, S,
+N's parent slot) before the free, not after — same rule as the single-child splice
+case, just spread across a whole loop instead of one splice.
+
 **Personal Notes**
 We did not use a shared sentinel due to how every parent with a missing child would claim that that one shared sentinel is their child, when in reality the parent which most recently wrote to it, is the one who is the parent.
 
