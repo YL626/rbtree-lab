@@ -157,6 +157,68 @@ int rb_insert(rbtree_t *t, const char *key, void *value) {
     return 0;
 }
 
+static struct rb_node *find_node(const rbtree_t *t, const char *key) {
+    struct rb_node *cur = t->root;
+    while (cur != NULL) {
+        int cmp = strcmp(key, cur->key);
+        if (cmp == 0) return cur;
+        cur = (cmp < 0) ? cur->left : cur->right;
+    }
+    return NULL;
+}
+
+static struct rb_node *tree_min(struct rb_node *n) {
+    while (n->left != NULL) n = n->left;
+    return n;
+}
+
+/* Puts v in u's slot (u->parent, or t->root) -- the only place delete
+ * touches t->root or reparents a node, mirroring the rotations. */
+static void transplant(rbtree_t *t, struct rb_node *u, struct rb_node *v) {
+    if (v != NULL) v->parent = u->parent;
+    if (u->parent == NULL)         t->root = v;
+    else if (u == u->parent->left) u->parent->left = v;
+    else                            u->parent->right = v;
+}
+
+int rb_delete(rbtree_t *t, const char *key) {
+    struct rb_node *z = find_node(t, key);
+    if (z == NULL) return -1;
+
+    struct rb_node *n;
+    bool free_own_payload = true;
+
+    if (z->left != NULL && z->right != NULL) {
+        struct rb_node *y = tree_min(z->right);
+        rb_free(z->key);
+        if (t->value_free) t->value_free(z->value);
+        z->key = y->key;
+        z->value = y->value;
+        n = y;
+        free_own_payload = false;
+    } else {
+        n = z;
+    }
+
+    struct rb_node *child = (n->left != NULL) ? n->left : n->right;
+    bool n_was_black = is_black(n);
+    transplant(t, n, child);
+
+    if (n_was_black && child != NULL) {
+        child->color = BLACK;
+    }
+    /* else if (n_was_black): doubly-black black-leaf case -- STEP2 fixup
+     * loop deferred to a later slice. */
+
+    if (free_own_payload) {
+        rb_free(n->key);
+        if (t->value_free) t->value_free(n->value);
+    }
+    rb_free(n);
+    t->size--;
+    return 0;
+}
+
 size_t rb_size(const rbtree_t *t) {
     return t->size;
 }

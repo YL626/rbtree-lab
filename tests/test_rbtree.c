@@ -331,13 +331,22 @@ static const struct delete_case delete_cases[] = {
     { "delete red leaf", { "b", "a", "c" }, 3, "a" },
     { "delete red leaf (mirror)", { "b", "a", "c" }, 3, "c" },
 
-    /* Black leaf with red sibling: d,b,f,a,c inserted keeps b and f black
-     * (children of black root d), with a and c red leaves under b. Deleting
-     * f (a black leaf whose sibling b is red... */
+    /* Black leaf with red sibling (verified against an instrumented scratch
+     * build that dumps real node colors -- an earlier candidate sequence
+     * looked right by hand-simulation but actually produced a BLACK sibling
+     * with red nephews, i.e. Case 4, not this Case 5):
+     * c,b,d,f,g,l,n inserted, then delete b: b ends up a black leaf whose
+     * sibling f is genuinely RED (f's children d is a black leaf, l is
+     * black with red children g,n). Deleting b forces Case 5 (red sibling
+     * rotated up over the parent, colors swapped, then the loop re-examines
+     * the new -- now black -- sibling). */
     { "delete black leaf with red sibling",
-      { "d", "b", "f", "a", "c" }, 5, "f" },
+      { "c", "b", "d", "f", "g", "l", "n" }, 7, "b" },
+    /* Mirror: p,n,l,k,c,i,e inserted, then delete p: p is a black leaf
+     * whose sibling k is RED, but on the LEFT this time, forcing the
+     * mirrored (right) rotation direction. */
     { "delete black leaf with red sibling (mirror)",
-      { "d", "f", "b", "e", "g" }, 5, "b" },
+      { "p", "n", "l", "k", "c", "i", "e" }, 7, "p" },
 
     /* Node with two children: root has two children; delete the root itself
      * so the successor-splice path is exercised on the two-children case
