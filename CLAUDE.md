@@ -15,18 +15,23 @@ rotations and insertion fixup, all cases + mirrors), `rb_foreach` (recursive in-
 `rb_validate` (all five invariants), and `rb_destroy` are implemented. `rb_destroy` already
 uses the non-recursive "Reach" technique (rotate into a right spine while freeing) — see
 "The Reach" below; it is not just the ungraded future work it's described as there.
-**`rb_delete` (and its fixup, including the mirrored cases) is declared in `include/rbtree.h`
-but not yet defined anywhere in `src/rbtree.c` — this is the current gap.** `src/pool.c` and
-`tests/fault_alloc.c` remain empty — out of scope until their respective milestones/mutations.
+**`rb_delete` is now implemented**, including `delete_fixup` (the doubly-black fixup loop,
+all cases plus the mirrored right-child symmetry) — both live in `src/rbtree.c` as of the
+M2 commits (`f32e9ef`..`8c55919`). `src/pool.c` and `tests/fault_alloc.c` remain empty —
+out of scope until their respective milestones/mutations.
 
-`tests/fuzz.c` is implemented (not just a placeholder `main`): it runs insert/find ops against
-a reference-model oracle (an array of key/value pairs), per its own M1 commit — it does not
-yet exercise `rb_delete`, since that function doesn't exist yet. `tests/test_rbtree.c` now
+`tests/fuzz.c` runs insert/find/delete ops against a reference-model oracle (an array of
+key/value pairs), interleaving `rb_delete` per its later M2 commit. `tests/test_rbtree.c`
 covers insert/find (including overwrite and missing-key cases), foreach ordering, validate
 (ascending/descending/scrambled/empty), the insertion-fixup rotation cases (LL/RR/LR/RL,
-red-uncle recolor), and destroy (single node, chain, value_free-once) — it does **not** yet
-have the table-driven `rb_delete` tests required by the spec (red leaf, black leaf with red
-sibling, two-child node, root deletion), since `rb_delete` isn't written yet.
+red-uncle recolor), destroy (single node, chain, value_free-once), and now the table-driven
+`rb_delete` cases required by the spec (red leaf + mirror, black leaf with red sibling +
+mirror, two-children root/non-root, single-node root, black node with one red child +
+mirror), plus missing-key delete and value_free-on-delete checks.
+
+As of 2026-09-14: `make test`, `make asan`, and `make memcheck` (from a clean rebuild) all
+pass with zero findings, including the fuzzer at 10^5 ops (asan/test) and 2×10^4 ops
+(memcheck, per the Makefile's smaller valgrind op count).
 
 ## Build and test commands
 
