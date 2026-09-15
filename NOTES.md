@@ -221,6 +221,28 @@ case, just spread across a whole loop instead of one splice.
 
 **Errors Caught**
 
+**Fixed Seed Test**
+Exact commands used (fixed seed: 42)
+
+ASan+UBSan build (manual compile, not via make asan since that target rebuilds with a time-based seed):
+gcc -std=c23 -Wall -Wextra -Werror -g -O1 -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer src/rbtree.c tests/fuzz.c -o build/fuzz_asan
+./build/fuzz_asan 100000 42
+Output:
+fuzz: seed=42 op_count=100000
+fuzz: 100000 insert/find/delete ops OK
+
+Valgrind memcheck (plain, non-sanitized build — sanitizer + valgrind conflict is the exact issue already documented in PROMPTLOG.md episode 3):
+gcc -std=c23 -Wall -Wextra -Werror -g -O1 -Iinclude src/rbtree.c tests/fuzz.c -o build/fuzz
+valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./build/fuzz 100000 42
+Output:
+fuzz: seed=42 op_count=100000
+fuzz: 100000 insert/find/delete ops OK
+==14773== HEAP SUMMARY:
+==14773==     in use at exit: 0 bytes in 0 blocks
+==14773==   total heap usage: 87,024 allocs, 87,024 frees, 1,485,580 bytes allocated
+==14773== All heap blocks were freed -- no leaks are possible
+==14773== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)
+
 **Personal Notes**
 We did not use a shared sentinel due to how every parent with a missing child would claim that that one shared sentinel is their child, when in reality the parent which most recently wrote to it, is the one who is the parent.
 
