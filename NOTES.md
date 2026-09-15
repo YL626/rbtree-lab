@@ -102,7 +102,36 @@ panel before you scroll, because arguing about 35 for ten minutes now is conside
 discovering at the walkthrough that you learned deletion fixup and merely memorized this.
 FIGURE 4
 
-We decided to extend the fuzzer to include case 3, where we need an extended fixup to climb up the tree. There was a gap in coverage. This also was to cover the fact that the 9 table-driven cases we came up with did not exercse a multi-level delete_fixup climb (case 3 recoloring and moving up more than one ancestor) or a debt that climbs up to the root. 
+We decided to extend the fuzzer to include case 3, where we need an extended fixup to climb up the tree. There was a gap in coverage. This also was to cover the fact that the 9 table-driven cases we came up with did not exercse a multi-level delete_fixup climb (case 3 recoloring and moving up more than one ancestor) or a debt that climbs up to the root.
+
+UPDATE (2026-09-15, M2 coverage audit): part of this gap is now closed by table rows, not just
+the fuzzer. Added 8 more rows to `delete_cases[]` (17 total) pinning every named `delete_fixup`
+branch that wasn't yet isolated by a dedicated case: Case 4 far-nephew-red-direct + mirror,
+Case 4 near-nephew-red-conversion (the `rotate_right(t,sib)`/`rotate_left(t,sib)` branch) +
+mirror, Case 3a (both nephews black, red parent, terminal absorb) + mirror, and Case 3b (both
+nephews black, black parent, genuine multi-level climb — 2 climbing passes then a Case-4
+terminal) + mirror.
+
+None of these were derivable from small hand-built trees the way the earlier cases were.
+Exhaustive permutation search found Case 3a needs at least 8 nodes (every insertion order of
+4-7 sequential keys was checked; zero produced a non-root red node with two black
+leaf-children). Case 3b's multi-level climb needed randomized search over much larger trees
+(found at n=60) plus delta-debug shrinking down to a 38-node floor — no sequence under 38 nodes
+reproduced two real climbing passes across everything tried. Every sequence was verified
+against the real compiled `rb_delete`/`delete_fixup` (an instrumented scratch copy used only
+for tracing/counting, `src/rbtree.c` itself untouched) before being written into the test file.
+
+What's still open: a genuine **climb-to-root** case (the debt surviving every ancestor up to
+and including the root). Searched for it — random trees up to 500 nodes, plus a search
+specifically targeting leaves whose entire ancestor chain to the root is already black (the
+best-case setup for it) — and never got past 3 climbing iterations. This is NOT a proof it's
+impossible: nothing in the five RB invariants forbids an all-black root-to-leaf path (a fully
+black, perfectly balanced tree is a legal red-black tree), so the open question is specifically
+whether the standard insert-only fixup algorithm can ever reach that state, which the search
+budget spent here couldn't settle either way. Left to the fuzzer's existing >=10^5-op coverage
+rather than forced into a table row — the spec's table-driven requirement (see CLAUDE.md) never
+named this case, so leaving it to the fuzzer is a scoped decision, not a shortcut. Full
+derivation trace and the back-and-forth that led here: `PROMPTLOG.md` episode 8.
 
 
 
@@ -236,7 +265,7 @@ So the sequence of iterations is: zero or more red-uncle steps, each strictly de
 
 I can defend this at the walkthrough. Nothing here contradicts the six test cases already passing — the red-uncle test (test_insert_triggers_red_uncle_recolor) exercises exactly one continuing iteration before the final t->root->color = BLACK catches the loop-exit-with-red-root edge case, se a black-uncle case landing directly on the terminal branch.
 
-
+Only a node with childless black nodes calls delete_fixup
 
 Self-tests for rb_find and rb_insert (confirm you can answer these before moving on — they're exactly the kind of
  question the live walkthrough asks):

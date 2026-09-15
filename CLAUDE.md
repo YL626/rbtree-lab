@@ -24,12 +24,28 @@ out of scope until their respective milestones/mutations.
 key/value pairs), interleaving `rb_delete` per its later M2 commit. `tests/test_rbtree.c`
 covers insert/find (including overwrite and missing-key cases), foreach ordering, validate
 (ascending/descending/scrambled/empty), the insertion-fixup rotation cases (LL/RR/LR/RL,
-red-uncle recolor), destroy (single node, chain, value_free-once), and now the table-driven
-`rb_delete` cases required by the spec (red leaf + mirror, black leaf with red sibling +
-mirror, two-children root/non-root, single-node root, black node with one red child +
-mirror), plus missing-key delete and value_free-on-delete checks.
+red-uncle recolor), destroy (single node, chain, value_free-once), and the table-driven
+`rb_delete` cases. This now spans 17 rows in `delete_cases[]`: the spec's required minimum
+(red leaf + mirror, black leaf with red sibling + mirror, two-children root/non-root,
+single-node root, black node with one red child + mirror — 9 rows) plus an M2 coverage-audit
+pass that pins every remaining named `delete_fixup` branch by construction rather than
+relying only on the fuzzer to hit them incidentally: Case 4 far-nephew-red-direct + mirror,
+Case 4 near-nephew-red-conversion + mirror (the `rotate_right(t, sib)`/`rotate_left(t, sib)`
+branch), Case 3a (both nephews black, red parent, terminal) + mirror, and Case 3b (both
+nephews black, black parent — a genuine multi-level climb, 2 climbing passes before a Case-4
+terminal) + mirror (8 rows). The Case-4/3a/3b rows needed real search to construct (exhaustive
+permutation search for Case 3a — no tree under 8 nodes produces it; randomized search +
+delta-debug shrinking for Case 3b's multi-level climb — no tree under 38 nodes reproduces two
+real climbing passes), not hand-derivation, and every sequence was verified against the real
+compiled `rb_delete`/`delete_fixup` (an instrumented scratch copy for tracing, never a
+reimplementation) before being added. A genuine climb-to-root case was searched for (random
+trees up to 500 nodes, plus a targeted search for all-black-ancestor-chain leaves) and not
+found; per NOTES.md's own "Confusions" note this gap is deliberately left to the fuzzer's
+existing ≥10^5-op coverage rather than forced into a table row — the spec's table-driven
+requirement (below) does not name it, and its absence from the table is a scoped decision, not
+an oversight. See `PROMPTLOG.md` episode 8 for the full derivation-and-pushback record.
 
-As of 2026-09-14: `make test`, `make asan`, and `make memcheck` (from a clean rebuild) all
+As of 2026-09-15: `make test`, `make asan`, and `make memcheck` (from a clean rebuild) all
 pass with zero findings, including the fuzzer at 10^5 ops (asan/test) and 2×10^4 ops
 (memcheck, per the Makefile's smaller valgrind op count).
 

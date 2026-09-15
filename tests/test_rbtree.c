@@ -91,7 +91,7 @@ static void test_overwrite_with_null_value_free_does_not_crash(void) {
     rb_destroy(t);
 }
 
-#define TEST_MAX_KEYS 8
+#define TEST_MAX_KEYS 40
 
 struct order_ctx {
     const char *keys[TEST_MAX_KEYS];
@@ -358,6 +358,126 @@ static const struct delete_case delete_cases[] = {
 
     /* Root deletion, single node: the only node in the tree is the root. */
     { "delete root (single node tree)", { "only" }, 1, "only" },
+
+    /* delete_fixup Case 4, far nephew red directly (no near-red conversion
+     * rotation needed): d,b,f,a,c,e,g,h inserted, then delete e. e is a black
+     * leaf; parent f is red; sibling g is black with g->right=h red (far
+     * nephew) and g->left=NULL (near nephew, black). is_black(sib->right) is
+     * false, so the code skips the rotate_right(sib) conversion at
+     * rbtree.c:203-208 and goes straight to the terminal recolor+rotate_left.
+     * Verified against a real build (not hand-simulated only): rb_delete
+     * returns 0, rb_validate passes, and the resulting shape/colors (f
+     * black, g promoted red, h recolored black) match predicting the
+     * terminal block by hand. */
+    { "delete Case 4 (sibling black, far nephew red, direct)",
+      { "d", "b", "f", "a", "c", "e", "g", "h" }, 8, "e" },
+    /* Mirror: e,g,c,h,f,d,b,a is the exact structural mirror of the above
+     * (built by mapping each key to its mirrored in-order role, then
+     * verifying the pre-delete tree's shape/colors are the left-right
+     * mirror before deleting) -- delete d hits the x==parent->right branch,
+     * sib=b, far nephew=a red, same direct-terminal path via rotate_right. */
+    { "delete Case 4 (sibling black, far nephew red, direct, mirror)",
+      { "e", "g", "c", "h", "f", "d", "b", "a" }, 8, "d" },
+
+    /* delete_fixup Case 4, near nephew red / far nephew black -- forces the
+     * rotate_right(t, sib) conversion at rbtree.c:203-208 before the same
+     * terminal block Case-4-direct already exercises. d,b,f,a,c,e,g,fz
+     * inserted (key "fz" sorts between f and g under strcmp), then delete e.
+     * e is a black leaf; parent f is red; sibling g is black with
+     * g->left=fz red (near nephew) and g->right=NULL (far nephew, black).
+     * is_black(sib->right) is true, so the conversion rotation fires (fz
+     * recolored black, g recolored red, rotate_right(g), sib reassigned to
+     * fz) before the terminal recolor+rotate_left. Verified against a real
+     * build: rb_delete returns 0, rb_validate passes, and the resulting
+     * shape (fz promoted red, f and g as its black children) matches
+     * predicting the conversion-then-terminal sequence by hand. */
+    { "delete Case 4 (sibling black, near nephew red, conversion)",
+      { "d", "b", "f", "a", "c", "e", "g", "fz" }, 8, "e" },
+    /* Mirror: e,g,c,h,f,d,a,b is the structural mirror (mapping
+     * f<->c, fz<->b, g<->a, e<->d, d<->e, c<->f, b<->g, a<->h), verified
+     * node-by-node against the left case's shape before deleting -- delete
+     * d hits the x==parent->right branch, sib=a, near nephew=b red (far
+     * nephew NULL), forcing the mirrored rotate_left(t, sib) conversion. */
+    { "delete Case 4 (sibling black, near nephew red, conversion, mirror)",
+      { "e", "g", "c", "h", "f", "d", "a", "b" }, 8, "d" },
+
+    /* delete_fixup Case 3a: both nephews black, PARENT RED -- terminal (no
+     * climb). Exhaustively brute-forced every insertion permutation of
+     * n=4..8 sequential keys against the real rb_insert looking for a
+     * non-root red node with two black children whose own children are
+     * black; zero matches exist below n=8 (a red-uncle recolor producing
+     * this shape needs a same-black-height sibling subtree under the root,
+     * which needs real depth). a,b,c,d,e,f,g,h ascending, then delete a:
+     * a is a black leaf; parent b is red; sibling c is black with both
+     * children NIL (nephews). delete_fixup's x==parent->left branch skips
+     * Case 5 (sib not red) and lands in the both-nephews-black check
+     * (rbtree.c:198), which recolors c red and reassigns x=b, parent=d --
+     * then the while guard's is_black(x) sees x=b is RED and exits the loop
+     * immediately (no second iteration/climb), so the post-loop catch-all
+     * at rbtree.c:243 paints b black. Two recolors, zero rotations, debt
+     * absorbed in one step because b had "room" (was red) to become black.
+     * Verified against a real build: rb_delete returns 0, rb_validate
+     * passes, and b(B)/c(R) with f's subtree completely untouched matches
+     * the hand-traced recolor exactly. */
+    { "delete Case 3a (sibling black, both nephews black, parent red)",
+      { "a", "b", "c", "d", "e", "f", "g", "h" }, 8, "a" },
+    /* Mirror: h,g,f,e,d,c,b,a (the mirror of a fully-ascending sequence is
+     * the fully-descending one) -- delete h hits the x==parent->right
+     * branch, sib=f (both children NIL), parent g red; same terminal
+     * recolor-absorb, verified as g's exact structural mirror before and
+     * after delete. */
+    { "delete Case 3a (sibling black, both nephews black, parent red, mirror)",
+      { "h", "g", "f", "e", "d", "c", "b", "a" }, 8, "h" },
+
+    /* delete_fixup Case 3b: both nephews black, PARENT BLACK -- the debt
+     * does NOT terminate, it climbs (x=parent; parent=x->parent) and the
+     * whole case-selection logic re-runs fresh one level up. NOTES.md's own
+     * gap note: none of the original 9 table cases exercised a climb of
+     * more than one ancestor. Random search + delta-debug shrinking (over
+     * an instrumented scratch copy of delete_fixup, never src/rbtree.c
+     * itself) found this is genuinely hard to produce small -- no sequence
+     * under 38 nodes reproduces two real climbing passes; every insertion
+     * permutation tried at n<38 either never reached delete_fixup's loop
+     * body twice or resolved by the second level. Traced against the real
+     * compiled rb_delete (case labels added via fprintf instrumentation,
+     * no logic changed):
+     *   iter1: x=NIL,   parent=00028(B) -> Case 3 (sib=00029, both nephews
+     *          NIL) -> sib recolored RED, x=00028, parent=00026 (CLIMBS,
+     *          since 00028 was black -- nothing to absorb the debt yet)
+     *   iter2: x=00028, parent=00026(B) -> Case 3 mirror (sib=00023, both
+     *          nephews black) -> sib recolored RED, x=00026, parent=00021
+     *          (CLIMBS again, 00026 also black)
+     *   iter3: x=00026, parent=00021(R) -> Case 4 mirror (sib=00012, red
+     *          nephew) -> terminal rotate+recolor, returns.
+     * rb_validate passes before and after, rb_delete returns 0. This is the
+     * longest climb found across every search strategy tried (random trees
+     * up to 500 nodes, plus a targeted search biased toward all-black
+     * ancestor chains); a genuine climb-to-root was not found and is left
+     * to the fuzzer's existing >=10^5-op coverage rather than forced into
+     * a table row -- the spec's table-driven requirement (NOTES.md:58-60)
+     * names red leaf / black-leaf-with-red-sibling / two-children / root
+     * deletion as the minimum, not a climb-to-root case, and NOTES.md's own
+     * "Confusions" note already resolves this specific gap by extending
+     * the fuzzer, not by adding more table rows. */
+    { "delete Case 3b (both nephews black, parent black -- multi-level climb)",
+      { "00030","00033","00058","00038","00034","00017","00031","00021","00018","00029",
+        "00028","00040","00027","00047","00026","00020","00006","00023","00012","00053",
+        "00000","00001","00056","00009","00054","00022","00015","00013","00002","00010",
+        "00008","00003","00024","00007","00005","00025","00016","00004" },
+      38, "00027" },
+    /* Mirror-starting climb (iter1 lands in the x==parent->right branch
+     * instead): same shrink methodology, independently found and reduced
+     * to 38 nodes.
+     *   iter1: x=NIL,   parent=058(B) -> Case 3 mirror (sib=057) -> CLIMBS
+     *   iter2: x=058,   parent=056(B) -> Case 3 mirror (sib=052) -> CLIMBS
+     *   iter3: x=056,   parent=048(R) -> Case 4 mirror (sib=040) -> TERMINAL
+     * rb_validate passes before/after, rb_delete returns 0. */
+    { "delete Case 3b (both nephews black, parent black -- multi-level climb, mirror)",
+      { "059","058","042","040","029","030","002","024","034","006",
+        "012","023","020","031","036","056","007","048","004","001",
+        "011","057","054","051","033","009","005","010","052","050",
+        "037","041","043","046","035","047","044","039" },
+      38, "059" },
 
     /* Black node with exactly one (red) child: b inserted then a inserted
      * descending leaves b black with a single red left child a (no fixup
