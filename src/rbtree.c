@@ -389,3 +389,107 @@ void rb_destroy(rbtree_t *t) {
     }
     rb_free(t);
 }
+
+#ifdef RBTREE_TEST_HOOKS
+/* Test-only hooks for exercising rb_validate's negative paths (invariants
+ * 1-5). Compiled in only when RBTREE_TEST_HOOKS is defined (test_rbtree's
+ * build only, per the Makefile) so production/grading builds that compile
+ * this file without the macro never see these symbols at all. Each hook
+ * mutates only existing struct fields on nodes the tree already owns --
+ * no allocation, no freeing -- so rb_destroy's pointer-only teardown walk
+ * (left/right only; it never reads color, key contents, or t->size) stays
+ * safe to call afterward regardless of which invariant was broken.
+ *
+ * rb_validate checks invariants in order (1: root black, 2: no red-red,
+ * 3: black-height, 4: ordering, 5: size) and returns on the first failure,
+ * which is what lets each hook below isolate its target invariant's return
+ * code even when a mutation has a side effect on a later check. */
+
+/* Invariant 1: flip the root red. Root-color is checked first and
+ * unconditionally, so this isolates invariant 1 regardless of anything
+ * else about the tree. */
+void rb_test_force_root_red(rbtree_t *t) {
+    if (t != NULL && t->root != NULL) t->root->color = RED;
+}
+
+/* Invariant 2: find a RED node with a real (non-NULL) BLACK child and flip
+ * that child RED, producing a red-red pair. Returns 1 if found and
+ * corrupted, 0 if the fixture didn't have the needed shape. */
+static struct rb_node *find_red_with_black_child(struct rb_node *n) {
+    if (n == NULL) return NULL;
+    if (n->color == RED &&
+        ((n->left != NULL && n->left->color == BLACK) ||
+         (n->right != NULL && n->right->color == BLACK))) {
+        return n;
+    }
+    struct rb_node *found = find_red_with_black_child(n->left);
+    if (found != NULL) return found;
+    return find_red_with_black_child(n->right);
+}
+
+int rb_test_force_red_red(rbtree_t *t) {
+    if (t == NULL) return 0;
+    struct rb_node *p = find_red_with_black_child(t->root);
+    if (p == NULL) return 0;
+    struct rb_node *child = (p->left != NULL && p->left->color == BLACK)
+                             ? p->left : p->right;
+    child->color = RED;
+    return 1;
+}
+
+/* Invariant 3: find a non-root BLACK node whose parent is BLACK and whose
+ * own children are both BLACK-or-NIL, then flip it RED. That perturbs only
+ * that node's subtree's black count -- it can't create a red-red pair
+ * (parent stays black, its own children stay black) and it doesn't touch
+ * the root, so it isolates invariant 3 rather than tripping 1 or 2 first.
+ * Returns 1 if found and corrupted, 0 otherwise. */
+static struct rb_node *find_isolated_black_flip_target(struct rb_node *n) {
+    if (n == NULL) return NULL;
+    if (n->parent != NULL && n->color == BLACK && is_black(n->parent) &&
+        is_black(n->left) && is_black(n->right)) {
+        return n;
+    }
+    struct rb_node *found = find_isolated_black_flip_target(n->left);
+    if (found != NULL) return found;
+    return find_isolated_black_flip_target(n->right);
+}
+
+int rb_test_break_black_height(rbtree_t *t) {
+    if (t == NULL) return 0;
+    struct rb_node *n = find_isolated_black_flip_target(t->root);
+    if (n == NULL) return 0;
+    n->color = RED;
+    return 1;
+}
+
+/* Invariant 4: swap the key pointers of two existing nodes (located by
+ * their current key values), which breaks in-order strictly-increasing
+ * order without touching allocation, color, or structure -- each string is
+ * still owned by exactly one node afterward, just a different one. Returns
+ * 1 if both keys were found and swapped, 0 otherwise. */
+static struct rb_node *find_by_key(struct rb_node *n, const char *key) {
+    while (n != NULL) {
+        int cmp = strcmp(key, n->key);
+        if (cmp == 0) return n;
+        n = (cmp < 0) ? n->left : n->right;
+    }
+    return NULL;
+}
+
+int rb_test_swap_keys(rbtree_t *t, const char *key1, const char *key2) {
+    if (t == NULL) return 0;
+    struct rb_node *n1 = find_by_key(t->root, key1);
+    struct rb_node *n2 = find_by_key(t->root, key2);
+    if (n1 == NULL || n2 == NULL || n1 == n2) return 0;
+    char *tmp = n1->key;
+    n1->key = n2->key;
+    n2->key = tmp;
+    return 1;
+}
+
+/* Invariant 5: directly desync the size counter from the real node count,
+ * touching nothing else. Works on any tree, even empty. */
+void rb_test_bump_size(rbtree_t *t) {
+    if (t != NULL) t->size += 1;
+}
+#endif

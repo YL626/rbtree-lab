@@ -1,5 +1,8 @@
 CC := gcc
 CFLAGS := -std=c23 -Wall -Wextra -Werror -g -O1 -Iinclude
+# TEST_CFLAGS is recursively expanded (=, not :=) so it picks up the
+# asan target's target-specific `CFLAGS +=` override at build time.
+TEST_CFLAGS = $(CFLAGS) -DRBTREE_TEST_HOOKS
 SRC := src/rbtree.c
 TSRC := tests/test_rbtree.c
 BIN := build/test_rbtree
@@ -9,7 +12,7 @@ all: $(BIN) $(FUZZBIN)
 
 $(BIN): $(SRC) $(TSRC) include/rbtree.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(SRC) $(TSRC) -o $@
+	$(CC) $(TEST_CFLAGS) $(SRC) $(TSRC) -o $@
 
 $(FUZZBIN): $(SRC) tests/fuzz.c include/rbtree.h
 	@mkdir -p build

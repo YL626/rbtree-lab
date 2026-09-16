@@ -3,6 +3,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef RBTREE_TEST_HOOKS
+/* Defined in src/rbtree.c, only compiled in under RBTREE_TEST_HOOKS.
+ * Not part of the frozen public API in rbtree.h -- these exist solely to
+ * let tests manufacture invalid trees so rb_validate's negative paths can
+ * be exercised (see NOTES.md/PROMPTLOG.md for why the fuzzer alone can't:
+ * rb_insert/rb_delete never produce an invalid tree by construction). */
+extern void rb_test_force_root_red(rbtree_t *t);
+extern int  rb_test_force_red_red(rbtree_t *t);
+extern int  rb_test_break_black_height(rbtree_t *t);
+extern int  rb_test_swap_keys(rbtree_t *t, const char *key1, const char *key2);
+extern void rb_test_bump_size(rbtree_t *t);
+#endif
+
 static int failures = 0;
 
 static void check(int cond, const char *desc) {
@@ -155,11 +168,72 @@ static void test_validate_on_empty_tree(void) {
     rb_destroy(t);
 }
 
-/* No test exercises rb_validate actually rejecting a bad tree (invariant 4 or 5):
- * struct rb_node/struct rbtree are opaque outside src/rbtree.c, and rb_insert cannot
- * produce a mis-ordered tree or a size/count mismatch by construction. That case has
- * to wait until a real bug (most likely in fixup, later) can manufacture one, which
- * the fuzzer's periodic rb_validate calls are designed to catch when it happens. */
+#ifdef RBTREE_TEST_HOOKS
+static void test_validate_detects_red_root(void) {
+    rbtree_t *t = rb_create(NULL);
+    int a = 1, b = 2, c = 3;
+    check(rb_insert(t, "b", &a) == 0, "insert b for red-root corruption fixture");
+    check(rb_insert(t, "a", &b) == 0, "insert a for red-root corruption fixture");
+    check(rb_insert(t, "c", &c) == 0, "insert c for red-root corruption fixture");
+    check(rb_validate(t) == 0, "validate passes before corruption");
+    rb_test_force_root_red(t);
+    check(rb_validate(t) == 1, "validate detects invariant 1 (root is red)");
+    rb_destroy(t);
+}
+
+/* Insertion order for the invariant 2/3/4 fixtures below: verified (via a
+ * throwaway scratch probe against the real compiled rb_insert, never a
+ * reimplementation -- see PROMPTLOG.md) to produce node 'd' RED with real
+ * BLACK children 'c'/'f' (invariant 2's fixture) and node 'a' BLACK with
+ * BLACK parent 'b' and NIL children (invariant 3's fixture). */
+static rbtree_t *build_seven_key_fixture(void) {
+    rbtree_t *t = rb_create(NULL);
+    static int dummy;
+    const char *keys[] = {"b", "a", "c", "e", "d", "f", "g"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        check(rb_insert(t, keys[i], &dummy) == 0, "insert key for 7-key fixture");
+    }
+    return t;
+}
+
+static void test_validate_detects_red_red(void) {
+    rbtree_t *t = build_seven_key_fixture();
+    check(rb_validate(t) == 0, "validate passes before corruption");
+    check(rb_test_force_red_red(t) == 1,
+          "corruption hook found a red node with a black child");
+    check(rb_validate(t) == 2, "validate detects invariant 2 (red node has a red child)");
+    rb_destroy(t);
+}
+
+static void test_validate_detects_black_height_mismatch(void) {
+    rbtree_t *t = build_seven_key_fixture();
+    check(rb_validate(t) == 0, "validate passes before corruption");
+    check(rb_test_break_black_height(t) == 1,
+          "corruption hook found an isolated black node to flip");
+    check(rb_validate(t) == 3, "validate detects invariant 3 (black-height mismatch)");
+    rb_destroy(t);
+}
+
+static void test_validate_detects_order_violation(void) {
+    rbtree_t *t = build_seven_key_fixture();
+    check(rb_validate(t) == 0, "validate passes before corruption");
+    check(rb_test_swap_keys(t, "a", "g") == 1, "corruption hook swapped two key pointers");
+    check(rb_validate(t) == 4, "validate detects invariant 4 (in-order keys not increasing)");
+    rb_destroy(t);
+}
+
+static void test_validate_detects_size_mismatch(void) {
+    rbtree_t *t = rb_create(NULL);
+    int a = 1, b = 2, c = 3;
+    check(rb_insert(t, "b", &a) == 0, "insert b for size-mismatch fixture");
+    check(rb_insert(t, "a", &b) == 0, "insert a for size-mismatch fixture");
+    check(rb_insert(t, "c", &c) == 0, "insert c for size-mismatch fixture");
+    check(rb_validate(t) == 0, "validate passes before corruption");
+    rb_test_bump_size(t);
+    check(rb_validate(t) == 5, "validate detects invariant 5 (size/count mismatch)");
+    rb_destroy(t);
+}
+#endif
 
 static void test_insert_single_root_is_black(void) {
     rbtree_t *t = rb_create(NULL);
@@ -558,6 +632,13 @@ int main(void) {
     test_validate_on_descending_insertion_order();
     test_validate_on_scrambled_insertion_order();
     test_validate_on_empty_tree();
+#ifdef RBTREE_TEST_HOOKS
+    test_validate_detects_red_root();
+    test_validate_detects_red_red();
+    test_validate_detects_black_height_mismatch();
+    test_validate_detects_order_violation();
+    test_validate_detects_size_mismatch();
+#endif
     test_insert_single_root_is_black();
     test_insert_ascending_triggers_rr_rotation();
     test_insert_descending_triggers_ll_rotation();
