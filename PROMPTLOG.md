@@ -5,7 +5,9 @@ Annotated episodes from M2 (the `rb_delete` milestone: table-driven tests, the d
 judgment call — accepted, revised, or rejected, and why. Corresponding commits:
 `71b55ac`, `7bdf93a`, `f32e9ef`, `8fa9072`, `ddfdbf9`. Episodes 7-8 are the coverage-audit
 session (8 new `delete_cases[]` rows for Case 4/3a/3b, plus the CLAUDE.md/NOTES.md updates
-describing them), not yet committed as of writing.
+describing them), not yet committed as of writing. Episode 9 is a separate, later adversarial
+review session (fresh context, no memory of Episodes 1-8) targeting memory-safety and ownership
+correctness directly, also not yet committed as of writing.
 
 ---
 
@@ -242,3 +244,36 @@ M2 didn't produce a genuinely **rejected** diff — every proposed change was ul
 sometimes only after Claude caught and revised its own mistake first (Episode 1) rather than me
 pushing back on something it insisted was right. If a real rejection happens in M3, it belongs
 here on its own terms rather than retrofitted into this log.
+
+## 9. Adversarial Review M2 - Evening 5
+
+**The Prompt**
+
+Fresh session : reread the ownership/deletion/allocation-failure
+requirements in the spec, NOTES.md, and CLAUDE.md, then adversarially review the current
+`rb_delete`/`delete_fixup` implementation from scratch — assume a bug exists and keep hunting.
+Named three specific bug families to check for going in: a use-after-free in the two-child
+successor splice, a copied key leaked on the overwrite path, and an allocation whose NULL return
+goes unchecked. Told explicitly not to fix anything, and to flag closely related
+ownership/double-free/dangling-pointer/cleanup-path issues if any turned up.
+
+**Real Finding**
+rb_validate negative path coverage
+
+The adversarial review found that every existing rb_validate invocation expects a return value of 0 on an already-valid tree. No test deliberately creates an invariant violation and verifies that rb_validate returns a nonzero.
+
+This means the suite verifies that rb_validate acceps valid trees but not that it rejects invalid ones. Because the fuzzer relies on rb_validate as its source of truth, an undetected defect inside one of the checks could allow both the deterministic suite and fuzzer to pass. 
+
+Verdict: this is indeed a real finding, a test-coverage defect, not evidende that rb_validate itself is currently incorrect.
+
+**False Positive**
+ 
+delete_fixup dereferences sib without an explicit NULL guard, which initially looked unsafe. After tracing the red-black black-height invariant for both initial fixup entry and subsequent climb iterations, sibling connot be NULL at any reachable dereference point in a valid input tree. Therefore the missing guard is not an in contract defect. 
+
+Also cleared, all three of the specifically-named suspects from the prompt, each with its own falsification method rather than a bare "looks fine": the successor-splice UAF (traced the `free_own_payload` flag through to the final `rb_free(n)` — the aliased key/value pointer is freed exactly once, never read after being freed; falsifiable with ASan on a two-children delete), the leaked overwrite key (the overwrite branch never re-copies or reallocates a key at all, only `value` changes, so there's no second allocation to leak; falsifiable with `valgrind --leak-check=full` on a tight insert/insert/destroy repro), and the unchecked malloc (all 3 `rb_malloc` call sites — `rb_create`, the node struct, the key copy — are checked with correct cleanup on failure).
+
+Also worth recording: the `sib`-NULL verdict above didn't come out clean on the first pass. Claude initially hedged the induction proof as needing "a targeted fuzzer/asan hit to fully falsify" despite having just given a complete proof with no actual gap in it. Pushed back directly on why a completed proof would need empirical falsification at all — Claude re-examined its own reasoning, found no gap, and retracted the hedge as unwarranted overcaution rather than defending it. Same "verify structurally, don't just trust the trace" lesson as Episode 1, applied here to second-guessing a *correct* conclusion instead of a wrong one.
+
+**Adversarial Review Note**
+
+Despite deep research, Claude still could not find any confirmed ownership/memory-safety defect in rbtree.c. The real finding is that my validator testing isn't independently validating itself. 
