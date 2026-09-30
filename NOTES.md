@@ -1,4 +1,5 @@
-**Contracts**: 
+# HW1
+## **Contracts**: 
 
 include/rb_tree.h (the frozen contract)
 rbtree.c implements rb_tree.h
@@ -84,12 +85,12 @@ rb_validate must show a failure reason when it breaks a rule.
 
 account for the deletion case of deleting a black node with exactly one child. 
 
-**Thresholds**: 
+## **Thresholds**: 
 your fuzzer (tests/fuzz.c) performs ≥ 10^5
 random insert/find/delete operations against a reference model (a sorted array or a simple linked list is fine), calling rb_validate
 at least every 100 operations, under both asan and memcheck.
 
-**Choices left to me**: 
+## Choices left to me: 
 
 We will add the optional seam, rb_malloc and rb_free (routing as seen in contracts)
 
@@ -137,7 +138,7 @@ derivation trace and the back-and-forth that led here: `PROMPTLOG.md` episode 8.
 
 
 
-**Confusions:**
+## **Confusions:**
 
 Deletion case key (study aid, from quizzing myself against spec Section 3, pages 11-16
 — rb_delete isn't implemented yet, this is the decision tree to code against):
@@ -219,9 +220,9 @@ itself). If N is freed early, save whatever pointers the fixup loop needs (P, S,
 N's parent slot) before the free, not after — same rule as the single-child splice
 case, just spread across a whole loop instead of one splice.
 
-**Errors Caught**
+## **Errors Caught**
 
-**Fixed Seed Test**
+## **Fixed Seed Test**
 Exact commands used (fixed seed: 42)
 
 ASan+UBSan build (manual compile, not via make asan since that target rebuilds with a time-based seed):
@@ -363,4 +364,13 @@ Self-tests before moving on(for rb_destroy):
     is explicitly allowed to ignore, and why, given the earlier "leave parent pointers stale
     during teardown" decision?)
 
-   
+# HW2 (HW1 Continuation)
+
+## Notes/Tips from Spec
+Mutation 3 asks for a tree of a million
+nodes, and valgrind runs many times slower than native. Put the million-node case behind a flag
+or its own target so make memcheck still finishes inside a coffee break: run the large case under
+asan, which is fast enough, and a smaller case under valgrind. What you must not do is quietly
+shrink the large case because a timing problem was inconvenient. If your harness ends up running
+the “million-node” teardown at ten thousand nodes, say so in REFLECTION.md, and expect the
+walkthrough to ask about it.
