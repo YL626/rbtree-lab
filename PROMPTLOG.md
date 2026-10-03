@@ -1,10 +1,12 @@
 # PROMPTLOG
 
-Trimmed to the 5 most substantive annotated episodes from a longer working log kept across the
-`rb_delete` (M2) milestone, its coverage-audit follow-up, an adversarial review session, and the
-session that closed the gap that review found. Each entry is: what I asked, what came back, and
-my judgment call — accepted, revised, or rejected, and why. Corresponding commits: `71b55ac`,
-`f32e9ef`, `8fa9072`, `ddfdbf9`, `ff09cbb`, `7a6e2b7`.
+Trimmed to the 6 most substantive annotated episodes from a longer working log kept across the
+`rb_delete` (M2) milestone, its coverage-audit follow-up, an adversarial review session, the
+session that closed the gap that review found, and the start of HW2's Mutation 1 (allocation-
+failure fault injection). Each entry is: what I asked, what came back, and my judgment call —
+accepted, revised, or rejected, and why. Corresponding commits: `71b55ac`, `f32e9ef`, `8fa9072`,
+`ddfdbf9`, `ff09cbb`, `7a6e2b7`. Episode 6's Phase A work (`tests/fault_alloc.{c,h}`, the Makefile
+seam-linkage wiring, and the fault-injection test harness) is not yet committed as of this entry.
 
 ---
 
@@ -245,6 +247,67 @@ return codes (1-5) on the first run against the real implementation.
 This closes the last genuinely open *implementation* item from the DEVLOG audit at the top of
 this episode. What remains after this session is process deliverables only (raw session
 transcripts, `REFLECTION.md`, and committing this file's own pending edits) — not further code.
+
+---
+
+## 6. Mutation 1 plan — five rounds of pushback before a line of code was written, plus one post-implementation correction
+
+**Prompt:** Asked Claude (in plan mode) to design Mutation 1: wire `src/rbtree.c`'s allocation
+seam so `tests/fault_alloc.c` can deterministically inject allocation failures, trace every
+allocation `rb_insert` can hit, and design a fault-sweep harness proving `rb_insert`/`rb_delete`
+stay atomic and leak-free under every possible injected failure. Treated the plan itself as the
+thing to interrogate before any file was touched — five separate rounds of correction below, all
+during planning.
+
+**Round 1 — invented interface, unneeded build scaffolding.** Claude's first draft invented its
+own fault-injector function names (`fault_alloc_reset()` / `fault_alloc_set_fail_at()`) instead of
+asking what the actual required interface was, and proposed gating `rb_malloc`/`rb_free` behind a
+new `RBTREE_FAULT_ALLOC` macro with a second, separate "fault-sweep binary." Told Claude the exact
+required interface (`fault_alloc_arm(long)`, `fault_alloc_disarm(void)`, `fault_alloc_total(void)`)
+and pointed out the supplied Makefile already has exactly two binaries, both of which should link
+the injector — no macro or third binary needed. Claude re-read the actual (not assumed) Makefile
+and `fault_alloc.{c,h}` and reduced the design to: one seam, always linked, inert while disarmed.
+
+**Round 2 — fault_alloc_total semantics and ownership tracing.** Asked Claude to justify exactly
+what `fault_alloc_total()` counts (lifetime? since-arm? since-disarm?) against only what the spec
+actually promises, and separately to trace who frees a caller-owned value when an injected
+`rb_insert` failure correctly leaves ownership with the caller — a real leak risk in the harness
+itself, not in `rbtree.c`. Claude settled on "calls since the most recent `fault_alloc_arm()`"
+(justified by what the sweep actually needs, not by assumption) and added an explicit rule: the
+harness frees a rejected value with plain `free()`, never through the counting destructor, so the
+destructor-count assertion and the harness's own cleanup can't be confused with each other.
+
+**Round 3 — a plan that looked tests-first wasn't.** Claude's task list put the fault-triggering
+tests before the one necessary edit to `src/rbtree.c` (removing its `static rb_malloc`/`rb_free`
+so the injector can actually intercept calls) — meaning those tests could not have passed yet,
+making the ordering only cosmetically test-first. Caught this directly: "tests 3-8 cannot pass
+before the seam change." Claude restructured into explicit phases — build the harness, run it red
+against the unmodified `rbtree.c` and record *why* it's red, then make the seam-only edit, then
+rerun the same tests expecting green.
+
+**Round 4 — a termination-logic bug in the harness design itself, before implementation.** Claude's
+sweep loop ended on `if (!hit) break`, where `hit` meant "some call returned -1." Pointed out this
+conflates two different things: if a buggy API swallowed a `NULL` from `rb_malloc` and incorrectly
+returned success anyway, `hit` would stay false and the harness would misreport the sweep as
+legitimately finished instead of failing on the real bug. Claude reworked the loop to compare
+`fault_alloc_total()` against `n` directly: `total < n` is the only legitimate termination signal,
+and `total >= n` with no observed `-1` must fail the test rather than end the sweep.
+
+**Round 5 (post-implementation) — an arbitrary safety cap that didn't belong.** After Phase A was
+implemented and the expected red state confirmed, asked Claude to remove `FAULT_SWEEP_MAX_N` (a
+64-iteration cap Claude had added as a belt-and-suspenders bound around the loop) since the
+fixed, finite scenario already guarantees termination by construction — an unbounded `for (n = 1;
+; n++)` relying solely on the `fault_alloc_total() < n` condition is both sufficient and closer to
+what the spec actually says. Claude removed it in a 3-line diff and reran the focused tests,
+confirming the same 10 expected failures, unchanged.
+
+**Judgment: plan revised four times, implementation corrected once, nothing rejected outright.**
+Every correction was caught before it reached committed code — four during planning (interface,
+semantics, phase ordering, termination logic), one right after Phase A landed (the unneeded cap).
+Pattern worth keeping: for fault-injection/property-style harnesses specifically, scrutinize the
+*termination condition* and *ownership-on-failure* logic as hard as the production code being
+tested — a bug in the harness's own loop can silently mask the exact defect (an API swallowing an
+injected failure) the harness exists to catch.
 
 ---
 

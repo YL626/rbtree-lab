@@ -366,6 +366,20 @@ Self-tests before moving on(for rb_destroy):
 
 # HW2 (HW1 Continuation)
 
+
+## Walkthrough Notes
+Why doesn't a failed insert corrupt the tree?
+Both fallible allocations happen before the first tree pointer is changed.
+
+What happens if node allocation succeeds but key allocation fails?
+The unlinked node is freed and -1 is returned; the caller still owns the value.
+
+Why don't overwrite and delete need allocation-failure handling?
+They allocate nothing.
+
+Why must the sweep eventually terminate?
+The fixed scenario performs finitely many allocations, so eventually n is larger than all of them.
+
 ## Notes/Tips from Spec
 Mutation 3 asks for a tree of a million
 nodes, and valgrind runs many times slower than native. Put the million-node case behind a flag

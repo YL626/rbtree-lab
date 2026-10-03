@@ -1,4 +1,6 @@
 #include "rbtree.h"
+#include "fault_alloc.h"
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -619,6 +621,208 @@ static void test_delete_frees_value(void) {
     rb_destroy(t);
 }
 
+/* ---- Mutation 1: allocation-failure fault injection (tests/fault_alloc.{c,h}) ----
+ *
+ * These are expected to be RED until src/rbtree.c is wired to route through
+ * the fault_alloc seam (a later, separate commit) -- see the approved plan
+ * episode in PROMPTLOG.md. While src/rbtree.c still defines its own static
+ * rb_malloc/rb_free, arming this injector cannot affect what rb_create /
+ * rb_insert / rb_delete actually call, so fault_alloc_total() never moves
+ * off 0 no matter what is armed. test_fault_rb_create_failure,
+ * test_fault_insert_node_alloc_failure, and test_fault_insert_key_alloc_failure
+ * fail loudly for exactly that reason. test_fault_overwrite_allocates_nothing,
+ * test_fault_delete_allocates_nothing, and test_fault_sweep pass, but only
+ * vacuously -- they assert "zero (or some bounded number of) allocations
+ * were observed," which stays true whether the claim is genuinely satisfied
+ * or the seam is simply unconnected. Only becomes a meaningful suite once
+ * the seam change lands.
+ */
+
+/* Checks the spec's five minimums for "the tree is unchanged" after an
+ * injected allocation failure during rb_insert(t, failed_key, ...):
+ * rb_validate, rb_size, rb_find on the failed key, rb_find on every other
+ * previously-inserted key, and that the destructor was not invoked for the
+ * rejected (still caller-owned) value. */
+static void assert_unchanged(rbtree_t *t,
+                              const char *model_keys[], int *model_values[], int model_count,
+                              const char *failed_key, void *find_before, size_t size_before,
+                              int free_count_before, const char *label) {
+    char msg[256];
+
+    snprintf(msg, sizeof msg, "[%s] rb_validate passes after injected failure", label);
+    check(rb_validate(t) == 0, msg);
+
+    snprintf(msg, sizeof msg, "[%s] rb_size unchanged after injected failure", label);
+    check(rb_size(t) == size_before, msg);
+
+    snprintf(msg, sizeof msg, "[%s] rb_find(failed key) unchanged after injected failure", label);
+    check(rb_find(t, failed_key) == find_before, msg);
+
+    for (int i = 0; i < model_count; i++) {
+        snprintf(msg, sizeof msg, "[%s] surviving key %s still maps to its original value",
+                 label, model_keys[i]);
+        check(rb_find(t, model_keys[i]) == model_values[i], msg);
+    }
+
+    snprintf(msg, sizeof msg,
+             "[%s] value_free was not called for the rejected caller-owned value", label);
+    check(free_count == free_count_before, msg);
+}
+
+static void test_fault_rb_create_failure(void) {
+    fault_alloc_arm(1);
+    rbtree_t *t = rb_create(NULL);
+    check(t == NULL, "[rb_create] returns NULL when its own allocation is injected to fail");
+    check(fault_alloc_total() == 1, "[rb_create] fault_alloc_total is 1 at the injected failure");
+    fault_alloc_disarm();
+    if (t != NULL) rb_destroy(t); /* seam not yet wired -- rb_create unexpectedly succeeded */
+}
+
+static void test_fault_insert_node_alloc_failure(void) {
+    free_count = 0;
+    /* call 1 = rb_create's malloc; call 2 = rb_insert's node-struct malloc */
+    fault_alloc_arm(2);
+    rbtree_t *t = rb_create(counting_free);
+    check(t != NULL, "[node-alloc] rb_create succeeds before the armed failure");
+
+    size_t size_before = rb_size(t);
+    void  *find_before = rb_find(t, "a");
+    int free_count_before = free_count;
+    int *value = make_int(99);
+
+    int rc = rb_insert(t, "a", value);
+    check(rc == -1, "[node-alloc] rb_insert returns -1 when the node-struct allocation is injected to fail");
+    check(fault_alloc_total() == 2, "[node-alloc] fault_alloc_total is 2 at the injected failure");
+    assert_unchanged(t, NULL, NULL, 0, "a", find_before, size_before, free_count_before, "node-alloc");
+
+    if (rc != 0) free(value); /* tree never took ownership; harness reclaims it */
+    fault_alloc_disarm();
+    rb_destroy(t);
+}
+
+static void test_fault_insert_key_alloc_failure(void) {
+    free_count = 0;
+    /* call 1 = rb_create's malloc; call 2 = node-struct malloc; call 3 = key-copy malloc */
+    fault_alloc_arm(3);
+    rbtree_t *t = rb_create(counting_free);
+    check(t != NULL, "[key-alloc] rb_create succeeds before the armed failure");
+
+    size_t size_before = rb_size(t);
+    void  *find_before = rb_find(t, "a");
+    int free_count_before = free_count;
+    int *value = make_int(99);
+
+    int rc = rb_insert(t, "a", value);
+    check(rc == -1, "[key-alloc] rb_insert returns -1 when the key-copy allocation is injected to fail");
+    check(fault_alloc_total() == 3, "[key-alloc] fault_alloc_total is 3 at the injected failure");
+    assert_unchanged(t, NULL, NULL, 0, "a", find_before, size_before, free_count_before, "key-alloc");
+
+    if (rc != 0) free(value); /* tree never took ownership; harness reclaims it */
+    fault_alloc_disarm();
+    rb_destroy(t);
+}
+
+static void test_fault_overwrite_allocates_nothing(void) {
+    free_count = 0;
+    rbtree_t *t = rb_create(counting_free);
+    check(rb_insert(t, "apple", make_int(1)) == 0, "[overwrite] seed insert succeeds");
+
+    fault_alloc_arm(1);
+    int *second = make_int(2);
+    check(rb_insert(t, "apple", second) == 0,
+          "[overwrite] overwrite still succeeds with the very next allocation armed to fail");
+    check(fault_alloc_total() == 0,
+          "[overwrite] rb_malloc was never called (fault_alloc_total stays 0)");
+    fault_alloc_disarm();
+    rb_destroy(t);
+}
+
+static void test_fault_delete_allocates_nothing(void) {
+    free_count = 0;
+    rbtree_t *t = rb_create(counting_free);
+    check(rb_insert(t, "apple", make_int(1)) == 0, "[delete] seed insert succeeds");
+
+    fault_alloc_arm(1);
+    check(rb_delete(t, "apple") == 0,
+          "[delete] rb_delete still succeeds with the very next allocation armed to fail");
+    check(fault_alloc_total() == 0,
+          "[delete] rb_malloc was never called (fault_alloc_total stays 0)");
+    fault_alloc_disarm();
+    rb_destroy(t);
+}
+
+/* Deterministic fixed scenario (section 7c of the plan): ascending "a","b","c"
+ * triggers the RR rotation case in insert_fixup, so the sweep also
+ * demonstrates failures never reach fixup (fixup only runs after the
+ * unconditional link-in, which is always strictly after both of rb_insert's
+ * allocations). */
+static void test_fault_sweep(void) {
+    static const char *scenario_keys[] = { "a", "b", "c" };
+    const int scenario_count = 3;
+    bool terminated = false;
+
+    /* Unbounded on purpose: the scenario performs finitely many allocations
+     * by construction, so fault_alloc_total() < n (checked below) is
+     * guaranteed to fire and break this loop -- no arbitrary iteration cap
+     * is needed or wanted. */
+    for (long n = 1; ; n++) {
+        free_count = 0;
+        fault_alloc_arm(n);
+
+        rbtree_t *t = rb_create(counting_free);
+        if (t == NULL) {
+            check(fault_alloc_total() == n, "[sweep] rb_create's own allocation was the n-th call");
+            fault_alloc_disarm();
+            continue;
+        }
+
+        const char *model_keys[TEST_MAX_KEYS];
+        int        *model_values[TEST_MAX_KEYS];
+        int model_count = 0;
+        bool observed_failure = false;
+
+        for (int i = 0; i < scenario_count; i++) {
+            const char *key = scenario_keys[i];
+            size_t size_before = rb_size(t);
+            void  *find_before = rb_find(t, key);
+            int free_count_before = free_count;
+            int *value = make_int(i);
+
+            int rc = rb_insert(t, key, value);
+            if (rc == -1) {
+                check(fault_alloc_total() == n, "[sweep] injected failure landed at the armed call n");
+                assert_unchanged(t, model_keys, model_values, model_count,
+                                 key, find_before, size_before, free_count_before, "sweep");
+                free(value); /* tree never took ownership */
+                observed_failure = true;
+                break;
+            }
+            model_keys[model_count] = key;
+            model_values[model_count] = value;
+            model_count++;
+        }
+
+        long total = fault_alloc_total();
+        check(rb_validate(t) == 0, "[sweep] rb_validate passes at end of this run");
+        rb_destroy(t);
+        fault_alloc_disarm();
+
+        if (total < n) {
+            check(!observed_failure,
+                  "[sweep] scenario completed without reaching allocation n -- "
+                  "no rb_insert should have returned -1 in this run");
+            terminated = true;
+            break; /* legitimate termination: allocation n was never reached */
+        }
+        check(observed_failure,
+              "[sweep] allocation n was reached -- the corresponding call must have "
+              "returned its documented failure code");
+    }
+
+    check(terminated, "[sweep] sweep terminated via the legitimate completion condition "
+                       "(fault_alloc_total() < n after a completed scenario run)");
+}
+
 int main(void) {
     test_create_destroy_empty();
     test_destroy_null_is_safe();
@@ -651,6 +855,12 @@ int main(void) {
     test_delete_table_driven();
     test_delete_missing_key_returns_error();
     test_delete_frees_value();
+    test_fault_rb_create_failure();
+    test_fault_insert_node_alloc_failure();
+    test_fault_insert_key_alloc_failure();
+    test_fault_overwrite_allocates_nothing();
+    test_fault_delete_allocates_nothing();
+    test_fault_sweep();
     printf(failures == 0 ? "\nAll tests passed.\n" : "\n%d test(s) FAILED.\n", failures);
     return failures == 0 ? 0 : 1;
 }

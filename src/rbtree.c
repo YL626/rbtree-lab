@@ -1,4 +1,5 @@
 #include "rbtree.h"
+#include "fault_alloc.h"
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -20,9 +21,6 @@ struct rbtree {
     size_t            size;
     rb_value_free_fn  value_free;
 };
-
-static void *rb_malloc(size_t n) { return malloc(n); }
-static void  rb_free(void *p)    { free(p); }
 
 static bool is_red(const struct rb_node *n)  { return n != NULL && n->color == RED; }
 static bool is_black(const struct rb_node *n) { return !is_red(n); }
