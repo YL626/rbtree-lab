@@ -4,10 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-This is a CS370 lab implementing a red-black tree in C. `include/rbtree.h` is the frozen
-contract. `NOTES.md` contains the assignment spec, the design decisions already made
-(including a devlog of the NIL/parent-pointer/teardown reasoning), and constraints that must
-not be violated — read it before writing any code here.
+This is a CS370 lab implementing a red-black tree in C, now on its second assignment (HW2,
+`CS370-HW2.pdf`, a continuation of HW1). `include/rbtree.h` is the frozen contract — it was
+re-frozen for HW2 and now also declares `rb_create_pooled` (Mutation 2: node storage drawn
+from an internal slab pool) and `rb_snapshot` (Mutation 4: O(1) copy-on-write snapshot, "The
+Reach" — no longer just ungraded prep, see below). Neither is implemented yet. `NOTES.md`
+contains the assignment spec, the design decisions already made (including a devlog of the
+NIL/parent-pointer/teardown reasoning and an HW2 section with spec notes/tips), and
+constraints that must not be violated — read it before writing any code here.
 
 Current state of `src/rbtree.c`: `rb_create`, the node/tree structs (with parent pointer),
 the `rb_malloc`/`rb_free` seam, `rb_find` (real BST search), `rb_size`, `rb_insert` (with
@@ -47,7 +51,23 @@ an oversight. See `PROMPTLOG.md` episode 8 for the full derivation-and-pushback 
 
 As of 2026-09-15: `make test`, `make asan`, and `make memcheck` (from a clean rebuild) all
 pass with zero findings, including the fuzzer at 10^5 ops (asan/test) and 2×10^4 ops
-(memcheck, per the Makefile's smaller valgrind op count).
+(memcheck, per the Makefile's smaller valgrind op count). This was the HW1 baseline; HW2
+work (pool allocator, fault injection, snapshot/Reach) starts from here and must not regress
+it.
+
+## Code map
+
+- `include/rbtree.h` — frozen public API / graded contract. Never edit.
+- `src/rbtree.c` — tree logic: allocation/ownership, rotations, insertion and deletion
+  fixups, `rb_validate`, teardown. All heap allocation here goes through the `rb_malloc`/
+  `rb_free` seam.
+- `src/pool.c` — HW2 slab pool implementation (backs `rb_create_pooled`); currently empty.
+- `tests/test_rbtree.c` — unit tests / HW1 regression suite (table-driven `rb_delete` cases,
+  insertion-fixup cases, validate, destroy, overwrite semantics).
+- `tests/fuzz.c` — randomized stress driver / reference-model (oracle) testing against a
+  plain array of key/value pairs.
+- `tests/fault_alloc.c` / `tests/fault_alloc.h` — allocation-seam shim and fault-injection
+  support for HW2 (make allocation fail on demand); currently empty.
 
 ## Build and test commands
 
@@ -74,10 +94,18 @@ done — the spec requires zero findings across the whole suite, including the e
   On insert failure the tree is unchanged and the caller keeps ownership of `value`. Overwriting
   an existing key frees the old value (the tree is its sole owner at that instant) before
   installing the new one. Every allocation has exactly one owner at all times.
-- **Allocation seam**: all allocation in `src/rbtree.c` routes through two 4-line wrappers,
-  `rb_malloc`/`rb_free`, which just forward to `malloc`/`free`. This is the optional tip from
-  the spec (not a hard requirement) — it pays off in the next assignment, where a test harness
-  makes allocation fail on demand.
+- **Allocation seam (now load-bearing, HW2)**: ALL heap allocation in `src/` must route
+  through the `rb_malloc`/`rb_free` seam — direct `malloc`/`free` anywhere in `src/` is a
+  defect, not a style nit. The seam exists so production allocation, the fault injector
+  (`tests/fault_alloc.c`/`.h`), and the HW2 pool allocator (`src/pool.c`) can each sit
+  underneath the tree interchangeably, without `rbtree.c`'s logic depending on which
+  implementation is currently active.
+- **Allocation failure (HW2)**: any allocation may fail, and every call through the seam
+  must be checked. Every failure path must unwind completely with no leaks — use the
+  goto-cleanup pattern below. A failed operation must leave the tree in exactly the state it
+  was in before the call, and must return its documented error code. Caller-owned values
+  (e.g. the `value` passed to `rb_insert`) must remain caller-owned when an operation fails;
+  the tree must never free or take ownership of something it didn't successfully absorb.
 - **Node shape**: nodes carry a parent pointer (a deliberate design choice beyond the bare
   minimum). NIL is represented as `NULL`, not a shared sentinel object — a shared sentinel
   is incompatible with per-node parent pointers (every node with a missing child would claim
@@ -117,15 +145,16 @@ done — the spec requires zero findings across the whole suite, including the e
   fine), calling `rb_validate` at least every 100 ops, and must be clean under both asan and
   memcheck.
 
-## The Reach (ungraded)
+## The Reach — HW1 (ungraded) vs HW2 (`rb_snapshot`, in scope)
 
-Non-recursive, O(1)-auxiliary-space teardown is **not required** for this assignment — it carries
-no points (spec §10, "The Reach"). Recursion in `rb_foreach`/`rb_destroy` is explicitly permitted
-here (spec §9); the non-recursive constraint is a preview of the *next* assignment's stack-budget
-requirements, not something this milestone set is graded on. If time allows, the technique is to
-rotate into a right spine while freeing so the tree's own pointer fields serve as the bookkeeping,
-implemented behind a second function and checked against the fuzzer's teardown — see CS370-HW1.pdf
-§10 for the full writeup before attempting it.
+HW1 framed non-recursive, O(1)-auxiliary-space teardown as ungraded prep for "the next
+assignment" (spec §10, "The Reach") — that next assignment is this one. `rb_destroy`'s
+rotate-into-a-right-spine-while-freeing technique already exists in `src/rbtree.c` from HW1;
+HW2's frozen header now adds `rb_snapshot` (Mutation 4: O(1) copy-on-write snapshot, NULL on
+allocation failure), which is graded here and is not yet implemented. Treat any reuse of the
+Reach technique for `rb_snapshot` as a new, from-scratch design question, not a copy-paste of
+`rb_destroy` — check CS370-HW2.pdf's own section for `rb_snapshot` before attempting it, and
+CS370-HW1.pdf §10 for the original Reach writeup.
 
 ## Process requirements / deliverables (spec §7, §15, §17)
 
@@ -156,14 +185,19 @@ These are graded independently of the code and must not be neglected or bulk-gen
 - Sanitizers: ‘make asan‘ Valgrind: ‘make memcheck‘
 - A change is DONE only when all three pass. Always run them; show output.
 ## Hard constraints
-- NEVER modify include/rbtree.h. It is the graded contract.
-- Check every allocation. malloc can return NULL; a NULL return must
-leave the tree unchanged and return the documented error code.
+- NEVER modify include/rbtree.h. It is the graded contract (HW1 and HW2 alike).
+- All heap allocation in src/ must go through rb_malloc/rb_free. Direct
+malloc/free in src/ is a defect — the seam must stay the single point where
+production allocation, the fault injector, and the pool allocator can swap in.
+- Check every allocation. Any allocation may fail; a NULL/failure return must
+leave the tree unchanged, fully unwind with no leaks, leave caller-owned
+values caller-owned, and return the documented error code.
 - NEVER weaken, skip, or delete a test to make the suite pass. If a test
 looks wrong, stop and explain why instead.
 ## Style
 - C23. -Wall -Wextra -Werror must stay clean. No VLAs.
-- Error handling: goto-cleanup pattern for multi-allocation functions.
+- goto is allowed only for cleanup-label unwinding (goto-cleanup pattern for
+multi-allocation / multi-failure-path functions).
 - Prefer the smallest diff that passes. Do not refactor unrelated code.
 - Every non-obvious loop gets a one-line invariant comment.
 ## Workflow
