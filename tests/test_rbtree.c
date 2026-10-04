@@ -623,19 +623,11 @@ static void test_delete_frees_value(void) {
 
 /* ---- Mutation 1: allocation-failure fault injection (tests/fault_alloc.{c,h}) ----
  *
- * These are expected to be RED until src/rbtree.c is wired to route through
- * the fault_alloc seam (a later, separate commit) -- see the approved plan
- * episode in PROMPTLOG.md. While src/rbtree.c still defines its own static
- * rb_malloc/rb_free, arming this injector cannot affect what rb_create /
- * rb_insert / rb_delete actually call, so fault_alloc_total() never moves
- * off 0 no matter what is armed. test_fault_rb_create_failure,
- * test_fault_insert_node_alloc_failure, and test_fault_insert_key_alloc_failure
- * fail loudly for exactly that reason. test_fault_overwrite_allocates_nothing,
- * test_fault_delete_allocates_nothing, and test_fault_sweep pass, but only
- * vacuously -- they assert "zero (or some bounded number of) allocations
- * were observed," which stays true whether the claim is genuinely satisfied
- * or the seam is simply unconnected. Only becomes a meaningful suite once
- * the seam change lands.
+ * src/rbtree.c routes all heap allocation through rb_malloc/rb_free (commit
+ * a250531), so these are meaningful: arming the injector genuinely reaches
+ * rb_create/rb_insert's allocations, and test_fault_sweep's overwrite/delete
+ * steps assert both fault_alloc_total() and value_free call counts, so
+ * "zero allocations" there is a checked claim, not a vacuous one.
  */
 
 /* Checks the spec's five minimums for "the tree is unchanged" after an
@@ -751,14 +743,34 @@ static void test_fault_delete_allocates_nothing(void) {
     rb_destroy(t);
 }
 
-/* Deterministic fixed scenario (section 7c of the plan): ascending "a","b","c"
- * triggers the RR rotation case in insert_fixup, so the sweep also
- * demonstrates failures never reach fixup (fixup only runs after the
+/* Deterministic fixed scenario (section 7c of the plan, extended): ascending
+ * "a","b","c" triggers the RR rotation case in insert_fixup, so the sweep
+ * also demonstrates failures never reach fixup (fixup only runs after the
  * unconditional link-in, which is always strictly after both of rb_insert's
- * allocations). */
+ * allocations). The scenario then overwrites "a" and deletes "b" -- neither
+ * allocates (src/rbtree.c's overwrite branch and rb_delete call rb_malloc
+ * zero times), so this proves that in-scenario, not just in the standalone
+ * test_fault_overwrite_allocates_nothing / test_fault_delete_allocates_nothing
+ * tests on a pristine tree -- and checks ownership/destructor accounting
+ * (exact value_free call counts), not just allocator call counts, around
+ * both ops. */
+typedef enum { SWEEP_INSERT, SWEEP_OVERWRITE, SWEEP_DELETE } sweep_op_kind_t;
+
+struct sweep_op {
+    sweep_op_kind_t kind;
+    const char     *key;
+    int             value;
+};
+
 static void test_fault_sweep(void) {
-    static const char *scenario_keys[] = { "a", "b", "c" };
-    const int scenario_count = 3;
+    static const struct sweep_op scenario[] = {
+        { SWEEP_INSERT,    "a", 0  },
+        { SWEEP_INSERT,    "b", 1  },
+        { SWEEP_INSERT,    "c", 2  },
+        { SWEEP_OVERWRITE, "a", 10 },
+        { SWEEP_DELETE,    "b", 0  },
+    };
+    const int scenario_count = (int)(sizeof scenario / sizeof scenario[0]);
     bool terminated = false;
 
     /* Unbounded on purpose: the scenario performs finitely many allocations
@@ -782,24 +794,65 @@ static void test_fault_sweep(void) {
         bool observed_failure = false;
 
         for (int i = 0; i < scenario_count; i++) {
-            const char *key = scenario_keys[i];
-            size_t size_before = rb_size(t);
-            void  *find_before = rb_find(t, key);
+            const struct sweep_op *op = &scenario[i];
+            long total_before = fault_alloc_total();
             int free_count_before = free_count;
-            int *value = make_int(i);
 
-            int rc = rb_insert(t, key, value);
-            if (rc == -1) {
-                check(fault_alloc_total() == n, "[sweep] injected failure landed at the armed call n");
-                assert_unchanged(t, model_keys, model_values, model_count,
-                                 key, find_before, size_before, free_count_before, "sweep");
-                free(value); /* tree never took ownership */
-                observed_failure = true;
-                break;
+            if (op->kind == SWEEP_INSERT) {
+                size_t size_before = rb_size(t);
+                void  *find_before = rb_find(t, op->key);
+                int *value = make_int(op->value);
+
+                int rc = rb_insert(t, op->key, value);
+                if (rc == -1) {
+                    check(fault_alloc_total() == n, "[sweep] injected failure landed at the armed call n");
+                    assert_unchanged(t, model_keys, model_values, model_count,
+                                     op->key, find_before, size_before, free_count_before, "sweep");
+                    free(value); /* tree never took ownership */
+                    observed_failure = true;
+                    break;
+                }
+                check(free_count == free_count_before,
+                      "[sweep] insert of a new key frees nothing");
+                model_keys[model_count] = op->key;
+                model_values[model_count] = value;
+                model_count++;
+
+            } else if (op->kind == SWEEP_OVERWRITE) {
+                int *value = make_int(op->value);
+                int rc = rb_insert(t, op->key, value);
+                check(rc == 0, "[sweep] overwrite never allocates, so it cannot be "
+                               "the n-th call and always succeeds");
+                check(fault_alloc_total() == total_before,
+                      "[sweep] overwrite performed no allocation in-scenario");
+                check(free_count == free_count_before + 1,
+                      "[sweep] overwrite freed exactly the old value, once");
+                for (int j = 0; j < model_count; j++) {
+                    if (strcmp(model_keys[j], op->key) == 0) {
+                        model_values[j] = value;
+                        break;
+                    }
+                }
+
+            } else { /* SWEEP_DELETE */
+                int rc = rb_delete(t, op->key);
+                check(rc == 0, "[sweep] delete never allocates, so it cannot be "
+                               "the n-th call and always succeeds");
+                check(fault_alloc_total() == total_before,
+                      "[sweep] delete performed no allocation in-scenario");
+                check(free_count == free_count_before + 1,
+                      "[sweep] delete freed exactly the removed value, once");
+                for (int j = 0; j < model_count; j++) {
+                    if (strcmp(model_keys[j], op->key) == 0) {
+                        for (int k = j; k + 1 < model_count; k++) {
+                            model_keys[k] = model_keys[k + 1];
+                            model_values[k] = model_values[k + 1];
+                        }
+                        model_count--;
+                        break;
+                    }
+                }
             }
-            model_keys[model_count] = key;
-            model_values[model_count] = value;
-            model_count++;
         }
 
         long total = fault_alloc_total();
