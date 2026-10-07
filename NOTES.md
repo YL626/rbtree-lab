@@ -388,3 +388,25 @@ asan, which is fast enough, and a smaller case under valgrind. What you must not
 shrink the large case because a timing problem was inconvenient. If your harness ends up running
 the “million-node” teardown at ten thousand nodes, say so in REFLECTION.md, and expect the
 walkthrough to ask about it.
+
+## Thresholds
+4096-byte slabs. O(1)
+for pool_alloc and
+pool_free. 106 nodes
+under a 64 KB stack. live
++ free_objs == slabs *
+objs_per_slab. Zero leaks,
+not few.
+## Choices left up to me
+Where the slab header lives.
+What alignment you guarantee and how the stride enforces it. Right-spine teardown or pointer reversal? Morris or parent pointers? What
+your rb_foreach contract 
+says about callbacks that call
+back in?
+## Confusions
+“Why does pool reuse hide useafter-free from ASan?” “What
+exactly happens between the
+node alloc and the key copy?”
+“Why can’t the teardown loop
+spin forever?”
+
