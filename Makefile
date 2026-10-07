@@ -3,7 +3,7 @@ CFLAGS := -std=c23 -Wall -Wextra -Werror -g -O1 -Iinclude -Itests
 # TEST_CFLAGS is recursively expanded (=, not :=) so it picks up the
 # asan target's target-specific `CFLAGS +=` override at build time.
 TEST_CFLAGS = $(CFLAGS) -DRBTREE_TEST_HOOKS
-SRC := src/rbtree.c
+SRC := src/rbtree.c src/pool.c
 TSRC := tests/test_rbtree.c
 FAULT_SRC := tests/fault_alloc.c
 FAULT_HDR := tests/fault_alloc.h

@@ -1,6 +1,8 @@
 #include "rbtree.h"
 #include "fault_alloc.h"
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +18,15 @@ extern int  rb_test_force_red_red(rbtree_t *t);
 extern int  rb_test_break_black_height(rbtree_t *t);
 extern int  rb_test_swap_keys(rbtree_t *t, const char *key1, const char *key2);
 extern void rb_test_bump_size(rbtree_t *t);
+
+/* Defined in src/pool.c (Mutation 2 slot geometry). Internal to the pool:
+ * absent from the frozen rbtree.h and deliberately given no header of its
+ * own, so it is declared here like the rb_test_* hooks above. It has external
+ * linkage in every build -- that is what keeps the production build
+ * warning-clean while no pool_create calls it yet -- but only this test
+ * declares it. */
+extern bool rb_pool_geometry(size_t obj_size, size_t *stride, size_t *slot0_offset,
+                             size_t *objs_per_slab, size_t *slack);
 #endif
 
 static int failures = 0;
@@ -876,6 +887,112 @@ static void test_fault_sweep(void) {
                        "(fault_alloc_total() < n after a completed scenario run)");
 }
 
+#ifdef RBTREE_TEST_HOOKS
+/* Direct check of the slab slot arithmetic (Mutation 2 geometry slice).
+ *
+ * Every expected number in the table below is worked out by hand, not
+ * recomputed from src/pool.c's formula: a test that re-derives the geometry it
+ * is checking lets a geometry bug cancel out of its own check. They also pin
+ * the in-band header's cost -- if the header grows past one alignment unit,
+ * slot0_offset moves and these rows fail loudly, which is the point.
+ *
+ * The literals are worked out for the ABI asserted here; on another one they
+ * would be wrong rather than merely unchecked, so assert it instead of
+ * assuming it. */
+static_assert(alignof(max_align_t) == 16 && sizeof(void *) == 8,
+              "geometry table literals are worked out for alignof(max_align_t) == 16 "
+              "and sizeof(void *) == 8; recompute the table for another ABI");
+
+#define GEOM_ALIGN ((size_t)16)
+#define GEOM_SLAB  ((size_t)4096)
+
+/* obj_size -> stride, slot0_offset, objs_per_slab, slack.
+ * usable = 4096 - 16 (header, rounded up to the alignment) = 4080. */
+static const struct geom_case {
+    const char *name;
+    size_t obj_size;
+    bool   ok;
+    size_t stride, slot0_offset, objs_per_slab, slack;
+} geom_cases[] = {
+    /* Rejected sizes: all four outputs must be zeroed. */
+    { "obj_size 0",                   0,             false,    0,  0,   0,    0 },
+    { "obj_size 4081 (one past fit)", 4081,          false,    0,  0,   0,    0 },
+    { "obj_size 4096 (whole slab)",   4096,          false,    0,  0,   0,    0 },
+    { "obj_size SIZE_MAX-8",          SIZE_MAX - 8,  false,    0,  0,   0,    0 },
+    { "obj_size SIZE_MAX",            SIZE_MAX,      false,    0,  0,   0,    0 },
+
+    /* Below a pointer: the slot still has to hold the free-list next. */
+    { "obj_size 1 -> pointer floor",  1,             true,    16, 16, 255,    0 },
+    { "obj_size 7 -> pointer floor",  7,             true,    16, 16, 255,    0 },
+    { "obj_size 8 (exactly a ptr)",   8,             true,    16, 16, 255,    0 },
+
+    /* Ordinary rounding, with and without slack. */
+    { "obj_size 9",                   9,             true,    16, 16, 255,    0 },
+    { "obj_size 16 (already stride)", 16,            true,    16, 16, 255,    0 },
+    { "obj_size 17 (rounds to 32)",   17,            true,    32, 16, 127,   16 },
+    { "obj_size 24",                  24,            true,    32, 16, 127,   16 },
+    { "obj_size 40 (rounds to 48)",   40,            true,    48, 16,  85,    0 },
+    { "obj_size 48 (the node size)",  48,            true,    48, 16,  85,    0 },
+    { "obj_size 49 (rounds to 64)",   49,            true,    64, 16,  63,   48 },
+    { "obj_size 100 (rounds to 112)", 100,           true,   112, 16,  36,   48 },
+
+    /* One slot only, which is where an off-by-one in the usable span shows. */
+    { "obj_size 2040",                2040,          true,  2048, 16,   1, 2032 },
+    { "obj_size 4064 (slack 16)",     4064,          true,  4064, 16,   1,   16 },
+    { "obj_size 4079 (exact fit)",    4079,          true,  4080, 16,   1,    0 },
+    { "obj_size 4080 (exact fit)",    4080,          true,  4080, 16,   1,    0 },
+};
+
+static void run_geom_case(const struct geom_case *c) {
+    char msg[256];
+    /* Pre-set to a value the helper must overwrite either way, so a forgotten
+     * store shows up as a mismatch rather than as an accidental zero. */
+    size_t stride = 0xBAD, slot0 = 0xBAD, objs = 0xBAD, slack = 0xBAD;
+
+    bool ok = rb_pool_geometry(c->obj_size, &stride, &slot0, &objs, &slack);
+
+    snprintf(msg, sizeof msg, "[geometry: %s] returns %s", c->name, c->ok ? "true" : "false");
+    check(ok == c->ok, msg);
+
+    snprintf(msg, sizeof msg,
+             "[geometry: %s] stride/slot0/objs/slack == %zu/%zu/%zu/%zu (got %zu/%zu/%zu/%zu)",
+             c->name, c->stride, c->slot0_offset, c->objs_per_slab, c->slack,
+             stride, slot0, objs, slack);
+    check(stride == c->stride && slot0 == c->slot0_offset &&
+          objs == c->objs_per_slab && slack == c->slack, msg);
+
+    if (!c->ok) return;
+
+    snprintf(msg, sizeof msg, "[geometry: %s] stride and slot0 are alignment multiples", c->name);
+    check(stride % GEOM_ALIGN == 0 && slot0 % GEOM_ALIGN == 0, msg);
+
+    snprintf(msg, sizeof msg, "[geometry: %s] slot0 leaves room for the in-band next pointer",
+             c->name);
+    check(slot0 >= sizeof(void *), msg);
+
+    /* Minimal padding, computed without overflow: the stride must cover the
+     * object (or the free-list pointer, whichever is larger) and must not
+     * over-round it by a whole alignment unit. */
+    size_t effective_min = (c->obj_size < sizeof(void *)) ? sizeof(void *) : c->obj_size;
+    snprintf(msg, sizeof msg, "[geometry: %s] stride is minimal for effective_min %zu",
+             c->name, effective_min);
+    check(stride >= effective_min && stride - effective_min < GEOM_ALIGN, msg);
+
+    snprintf(msg, sizeof msg, "[geometry: %s] slack is smaller than one slot", c->name);
+    check(objs >= 1 && slack < stride, msg);
+
+    /* The partition: every byte of the slab is header, slot, or slack. */
+    snprintf(msg, sizeof msg,
+             "[geometry: %s] slot0 + objs*stride + slack == 4096", c->name);
+    check(slot0 + objs * stride + slack == GEOM_SLAB, msg);
+}
+
+static void test_pool_geometry_table(void) {
+    size_t n = sizeof geom_cases / sizeof geom_cases[0];
+    for (size_t i = 0; i < n; i++) run_geom_case(&geom_cases[i]);
+}
+#endif
+
 int main(void) {
     test_create_destroy_empty();
     test_destroy_null_is_safe();
@@ -914,6 +1031,9 @@ int main(void) {
     test_fault_overwrite_allocates_nothing();
     test_fault_delete_allocates_nothing();
     test_fault_sweep();
+#ifdef RBTREE_TEST_HOOKS
+    test_pool_geometry_table();
+#endif
     printf(failures == 0 ? "\nAll tests passed.\n" : "\n%d test(s) FAILED.\n", failures);
     return failures == 0 ? 0 : 1;
 }

@@ -1,6 +1,6 @@
 # PROMPTLOG
 
-Trimmed to the 6 most substantive annotated episodes from a longer working log kept across the
+Trimmed to the 7 most substantive annotated episodes from a longer working log kept across the
 `rb_delete` (M2) milestone, its coverage-audit follow-up, an adversarial review session, the
 session that closed the gap that review found, and the start of HW2's Mutation 1 (allocation-
 failure fault injection). Each entry is: what I asked, what came back, and my judgment call —
@@ -308,6 +308,73 @@ Pattern worth keeping: for fault-injection/property-style harnesses specifically
 *termination condition* and *ownership-on-failure* logic as hard as the production code being
 tested — a bug in the harness's own loop can silently mask the exact defect (an API swallowing an
 injected failure) the harness exists to catch.
+
+## 7. Mutation 2 design session — a teaching pass before any code, one proposed file rejected, and a spec claim that does not hold in this repo
+
+**Prompt:** Deliberately split into two messages. The first was explicitly plan/exploration-only
+("Do not write or modify code yet"), and asked Claude to re-read the whole Mutation 2 section and
+companion guide and then *teach* it — ten concrete questions (what an `rb_pool_t` owns, why buy a
+4096-byte slab instead of per-node `malloc`, how a slab is divided, what live/free/uncarved mean,
+why an intrusive `next` can live inside a dead object, slab layout vs. free-list policy, what
+still comes from `rb_malloc`, how alloc/free reach O(1), how `pool_destroy` can free slabs with
+live objects, how Mutation 1 still applies) — then lay out the three decisions the spec leaves
+open with tradeoffs and failure paths for each, and **stop without choosing**. The second message
+made the three decisions and then set tonight's scope: one geometry function, a direct arithmetic
+test, full battery, commit if green.
+
+**What came back, and the one thing in it I had to push on.** The teaching pass was accurate and
+is what the decisions were made from. One claim in it was mine-to-check rather than Claude's to
+assert: the spec sells in-band slab headers partly because they make "which slab is this object
+in?" answerable by masking the object's address down to a slab boundary. Claude flagged on its own
+that this does **not** hold here — masking needs page-*aligned* slabs, and `rb_malloc` forwards to
+`malloc`, which guarantees `max_align_t` (16 bytes), not 4096; getting page-aligned blocks would
+mean `aligned_alloc`/`posix_memalign` behind the seam, which is a larger decision. I accepted
+that and chose in-band anyway, on the single-`rb_malloc`/single-failure-point argument alone, and
+had the masking benefit explicitly excluded from the written justification in NOTES.md. Worth
+recording because the tempting move was to keep a benefit the spec itself offered me; it just
+is not true of this build, and claiming it at the walkthrough would not have survived one
+question. The same pass also noted that nothing in the design needs the object-to-slab mapping
+anyway: a single intrusive free list makes `pool_free` indifferent to which slab an object came
+from, which is what keeps it O(1).
+
+**Rejected: the `src/pool.h` I was offered.** Claude's implementation plan proposed a new
+`src/pool.h` to hold the geometry type and prototype (and, later, the §8.2 pool API), flagging it
+as a decision for me because the spec's file tree names only `src/pool.c`. I rejected it: the
+file-level map is fixed, and the repo already had the `RBTREE_TEST_HOOKS` precedent for test-only
+visibility into internals (`rb_test_force_root_red` and friends), so the type and helper stay
+inside `src/pool.c` and `tests/test_rbtree.c` declares the helper itself. I added the constraint
+that drove the rest of the shape: the non-test build has to stay clean under `-Wall -Wextra
+-Werror` even though no `pool_create` calls the helper yet, and **not** by broadening
+`RBTREE_TEST_HOOKS` globally or adding build machinery. That forced out two consequences — the
+helper gets external linkage rather than `static` (a `static` unused function is a
+`-Wunused-function` error, while an external one is simply not referenced yet), and the four
+results come back through out-parameters rather than a shared struct, since with no header a
+struct would have to be duplicated in the test file. Claude compiled `pool.c` both ways
+separately to confirm, rather than asserting it.
+
+**Two tightenings of the test I specified myself.** First, the minimality assertion: Claude's plan
+had `stride < obj_size + ALIGN`, which overflows for sizes near `SIZE_MAX` and measures against
+the wrong baseline for objects smaller than a pointer. I replaced it with `effective_min =
+max(obj_size, sizeof(void *))`, `stride >= effective_min`, `stride - effective_min < ALIGN`.
+Second, I pinned the degenerate-size contract as *internal* only — zero size false, no-complete-
+slot false, overflow detected before the arithmetic wraps, outputs zeroed on false — explicitly
+refusing to let it become a public `pool_create` contract tonight, because that is a later design
+decision and writing it down early would have quietly made it one.
+
+**Judgment: teaching pass accepted, one proposed file rejected, one assertion form corrected, one
+spec-offered benefit discarded as inapplicable.** The split-prompt shape is what made this work:
+forbidding code in the first message meant the three decisions were made against a real
+explanation instead of being back-rationalized from a diff that already existed. Claude also
+volunteered one check I had not asked for and that I would not have thought to ask for — compiling
+three deliberately mutated copies of `pool.c` against the unmodified test (divide 4096 instead of
+the post-header span: 34 failed assertions; drop the rounding: 22; hand out the tail slack via
+ceiling division: 12), which turned "the table passes" into evidence that the table would catch
+the three specific bugs Figure 4's caption and the spec's own M2 review prompt name. Note for the
+process-coverage note below: the `src/pool.h` rejection was a rejected *plan element*, caught
+before any file was written — it is still not a rejected or oversized *diff*, and I am not
+counting it as one.
+
+---
 
 ---
 

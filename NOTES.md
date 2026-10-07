@@ -403,6 +403,82 @@ What alignment you guarantee and how the stride enforces it. Right-spine teardow
 your rb_foreach contract 
 says about callbacks that call
 back in?
+DECIDED (2026-10-06, Mutation 2 pool design — recorded before any `src/pool.c` code exists):
+
+**1. Alignment.** Slots are aligned to `_Alignof(max_align_t)` (fundamental alignment). The
+slot stride is `obj_size` rounded up to that alignment, and is also never smaller than
+`sizeof(void *)` so a dead slot can hold the intrusive free-list `next`. Because the first
+slot's offset inside the slab and the stride are both multiples of that alignment, and the
+block `rb_malloc` returns is already `max_align_t`-aligned, *every* slot address
+(`base + start + i*stride`) is aligned — not just slot 0. Getting only slot 0 right is the
+version of this bug that works and then works less.
+
+Why: `pool_create(size_t obj_size)` takes no alignment parameter, so the pool cannot be told
+what its caller needs and has to promise one unilaterally. The conservative fundamental
+promise costs some internal padding when `obj_size` is not already a multiple of it — for the
+current ~48-byte `struct rb_node` that cost happens to be zero, which is an accident worth
+noticing and not relying on — and buys a guarantee that stays true if the node layout changes.
+It also satisfies both uses a slot's bytes are put to across its lifetime: the live object
+while it is live, and the free-list pointer written over its front when it dies. The spec
+flags this as a `-fsanitize=undefined` matter ("alignment is one of those requirements that
+feels ceremonial until it is wrong"), and `make asan` is a gate, so a misalignment here is a
+build failure rather than a mystery.
+
+LIMIT (explicit): `max_align_t` is a *fundamental*-alignment guarantee only. It is not support
+for over-aligned types — anything demanding more than `max_align_t` via `_Alignas` (a
+cache-line-aligned or over-aligned SIMD object, say) is outside this pool's contract and would
+need an alignment parameter the frozen API does not have.
+
+**2. Slab metadata: in-band**, at the front of each 4096-byte slab.
+
+Why: one `rb_malloc` per slab, and therefore exactly one failure point when the pool grows.
+Out-of-band metadata would add a second allocation per slab, which means a second failure path
+with a real unwind (slab bought, header allocation fails => release the slab and leave the
+pool's counters untouched) and a second object for `pool_destroy` to release. In-band trades
+payload space to keep the pool's only failure mode "buy a new slab."
+
+Cost accepted: usable space is `4096 - header - alignment padding`, not 4096, so
+`objs_per_slab` must be derived from what is left after the header. That is precisely the
+off-by-one Figure 4's caption warns about ("the slab header, which eats bytes the naive
+division forgets") and that the spec's own adversarial-review prompt for M2 tells the reviewer
+to hunt for, alongside the tail slack that must never be handed out.
+
+Consequence for teardown: the next-slab link lives *inside* the block being released, so
+`pool_destroy` must read `next` before `rb_free`ing that slab — the same "save the pointer
+before you free the thing that contains it" rule as the HW1 right-spine teardown, one level
+down.
+
+Not relied on: the spec notes that in-band metadata makes "which slab is this object in?"
+answerable by masking. That requires page-*aligned* slabs, and `rb_malloc` forwards to
+`malloc`, which guarantees `max_align_t` (16 bytes), not 4096 — so masking is not actually
+available here and forms no part of this justification. Nothing in this design needs the
+object->slab mapping anyway: a single intrusive free list makes `pool_free` indifferent to
+which slab an object came from, which is what keeps it O(1).
+
+**3. `pool_stats` / `free_objs`:** the spec's operational definition — every slot that already
+exists which `pool_alloc` could return without calling `rb_malloc` again. That is free-list
+slots **plus** uncarved capacity in slabs already bought, because `pool_alloc` satisfies both
+without allocating and the caller cannot tell which path a slot arrived by. Hence
+`live + free_objs == slabs * objs_per_slab`.
+
+What that invariant actually asserts: every slot that exists is in exactly one of three states
+— live, on the free list, or never yet carved — with the last two both counting as
+`free_objs`, and none lost or double-counted. Tail slack is not a slot and contributes to
+neither side. It therefore catches a slot dropped on the floor, a slot handed out twice, a
+double `pool_free` (which also makes the free list cyclic), a carve loop that steps one slot
+into the slack, and a slab counted before its allocation actually succeeded — including after
+an injected failure, when it must still hold. Per the spec it is asserted repeatedly while the
+allocator is under stress, not once at the end: "the earliest assertion failure is usually much
+more informative than the corpse you discover ten thousand operations later."
+
+Still open (deliberately not decided yet): whether the three numbers come from maintained
+counters, an on-demand walk of the free list, or counters plus a debug-only walk that
+cross-checks them; how the tests get at `objs_per_slab`, given the public API does not expose
+it and having the tests recompute it would let a geometry bug cancel out of its own check;
+whether `pool_stats` tolerates NULL out-parameters; whether `pool_create` buys a slab eagerly
+or lazily; and what a `obj_size` too large to fit even once should do.
+
+
 ## Confusions
 “Why does pool reuse hide useafter-free from ASan?” “What
 exactly happens between the

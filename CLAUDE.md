@@ -21,8 +21,10 @@ uses the non-recursive "Reach" technique (rotate into a right spine while freein
 "The Reach" below; it is not just the ungraded future work it's described as there.
 **`rb_delete` is now implemented**, including `delete_fixup` (the doubly-black fixup loop,
 all cases plus the mirrored right-child symmetry) — both live in `src/rbtree.c` as of the
-M2 commits (`f32e9ef`..`8c55919`). `src/pool.c` and `tests/fault_alloc.c` remain empty —
-out of scope until their respective milestones/mutations.
+M2 commits (`f32e9ef`..`8c55919`). `tests/fault_alloc.c` is implemented as of HW2's M1
+commits (`a250531`, `a8f4439`). `src/pool.c` now holds the Mutation 2 slot-geometry helper
+only — the pool's allocation/carving/free-list machinery and `rb_create_pooled` are still
+out of scope until their respective slices.
 
 `tests/fuzz.c` runs insert/find/delete ops against a reference-model oracle (an array of
 key/value pairs), interleaving `rb_delete` per its later M2 commit. `tests/test_rbtree.c`
@@ -61,13 +63,18 @@ it.
 - `src/rbtree.c` — tree logic: allocation/ownership, rotations, insertion and deletion
   fixups, `rb_validate`, teardown. All heap allocation here goes through the `rb_malloc`/
   `rb_free` seam.
-- `src/pool.c` — HW2 slab pool implementation (backs `rb_create_pooled`); currently empty.
+- `src/pool.c` — HW2 slab pool implementation (backs `rb_create_pooled`). Currently the slot
+  geometry only: `rb_pool_geometry` (stride, first-slot offset, slots per slab, tail slack)
+  plus the in-band `struct rb_slab` header whose size it accounts for. Internal to the file by
+  design — no `src/pool.h`, since the spec's file map is fixed; `tests/test_rbtree.c` declares
+  the helper itself under `RBTREE_TEST_HOOKS`, as it already does for the `rb_test_*` hooks.
 - `tests/test_rbtree.c` — unit tests / HW1 regression suite (table-driven `rb_delete` cases,
   insertion-fixup cases, validate, destroy, overwrite semantics).
 - `tests/fuzz.c` — randomized stress driver / reference-model (oracle) testing against a
   plain array of key/value pairs.
 - `tests/fault_alloc.c` / `tests/fault_alloc.h` — allocation-seam shim and fault-injection
-  support for HW2 (make allocation fail on demand); currently empty.
+  support for HW2 (make allocation fail on demand). Implemented: `rb_malloc`/`rb_free` plus
+  `fault_alloc_arm`/`fault_alloc_disarm`/`fault_alloc_total`.
 
 ## Build and test commands
 
