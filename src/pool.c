@@ -1,12 +1,11 @@
 /* Mutation 2: slab pool allocator.
  *
- * Three slices live here so far: the slot geometry (the arithmetic that
+ * Four slices live here so far: the slot geometry (the arithmetic that
  * divides one page-sized slab into aligned, fixed-size slots), the pool
- * lifecycle (pool_create / pool_stats / pool_destroy), and slab growth plus
- * slot carving behind pool_alloc. Nothing here yet returns a slot to the
- * pool: pool_free, the intrusive free list, 0xDD debug poisoning and
- * rb_create_pooled are later slices, so a slot handed out today stays live
- * until the whole pool is destroyed.
+ * lifecycle (pool_create / pool_stats / pool_destroy), slab growth plus slot
+ * carving behind pool_alloc, and the intrusive free list behind pool_free
+ * with its 0xDD debug poisoning. The allocator is now complete; what remains
+ * for later slices is rb_create_pooled and the stress/fault battery over it.
  *
  * Design decisions this encodes (full reasoning in NOTES.md's HW2 "Choices
  * left up to me" and DEVLOG.md 2026-10-06/2026-10-08):
@@ -30,6 +29,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 /* In-band slab header. Only the slab chain lives here, so that a later
  * pool_destroy can walk every slab and release it; the carve cursor belongs
@@ -246,10 +246,11 @@ static bool pool_grow(rb_pool_t *p)
  *
  * The slot's bytes are uninitialized. p must be non-NULL.
  *
- * Order: uncarved capacity, then grow. SLICE C inserts the free-list pop
- * ahead of both, which is where reuse-before-carving starts to matter; today
- * free_head is permanently NULL, so that branch would be dead code and is
- * not written yet.
+ * Order: free list, then uncarved capacity, then grow. Reuse comes first so
+ * that slabs track the high-water mark of live rather than the total number
+ * of operations -- carving first would leave freed slots unreachable until a
+ * slab was exhausted, and an insert/delete workload would keep buying slabs
+ * while holding a growing pile of reusable ones.
  *
  * The one fallible step is the grow, and it happens before any counter is
  * touched, so "a failed pool_alloc leaves the pool exactly as it was" holds
@@ -257,6 +258,25 @@ static bool pool_grow(rb_pool_t *p)
 void *pool_alloc(rb_pool_t *p)
 {
     assert(p != NULL);
+
+    if (p->free_head != NULL) {
+        /* The dead slot's first bytes are the link, not an object; read it
+         * out before the slot is handed back to a caller who will overwrite
+         * it. memcpy rather than a cast, for the reason pool_free gives. */
+        void *slot = p->free_head;
+        void *next;
+        memcpy(&next, slot, sizeof next);
+
+        p->free_head = next;
+        p->free_count--;
+        p->live++;
+
+        /* The slot still carries its stale link and its 0xDD tail. Clearing
+         * them is not this function's job: a carved slot is uninitialized
+         * too, and a caller that forgets to initialize should find obvious
+         * garbage rather than plausible zeroes. */
+        return slot;
+    }
 
     if (p->carve_remaining == 0 && !pool_grow(p))
         return NULL;
@@ -276,13 +296,101 @@ void *pool_alloc(rb_pool_t *p)
     return slot;
 }
 
+/* ------------------------------------------------------------------------
+ * SLICE C: the intrusive free list, pool_free, and 0xDD debug poisoning.
+ *
+ * What remains after this slice: rb_create_pooled, and re-running the whole
+ * HW1 + M1 battery over a pooled tree.
+ *
+ * Both the poisoning and the free-list cross-check below are gated on
+ * NDEBUG -- the same notion of a "debug build" that assert already uses in
+ * this file, so there is no new knob and no build machinery. With the
+ * Makefile never defining NDEBUG they are active in every build the project
+ * actually produces (test, asan, memcheck, and the fuzzer), which is where
+ * they are wanted; -DNDEBUG compiles both out for a measurement-only build.
+ */
+
+#define RB_POOL_POISON 0xDD
+
+#ifndef NDEBUG
+/* Measures the free list independently of free_count, which is the whole
+ * point: the three numbers pool_stats reports are maintained counters, so
+ * live + free_objs == slabs * objs_per_slab is otherwise checked against the
+ * same values that pool_alloc and pool_free just produced. A double
+ * pool_free, for instance, decrements live twice and increments free_count
+ * twice -- the sum stays consistent while the same slot sits on the list
+ * twice and the list has become cyclic.
+ *
+ * Returns false if the walk disagrees with free_count, or if it runs past
+ * the number of slots that exist at all.
+ *
+ * O(free list), so this is debug-only and deliberately not on the alloc/free
+ * path, which must stay O(1). */
+static bool pool_free_list_agrees(const rb_pool_t *p)
+{
+    size_t bound = p->slab_count * p->objs_per_slab + 1;
+    size_t n     = 0;
+    void  *cur   = p->free_head;
+
+    /* Invariant: n counts the slots already stepped over, and the step that
+     * would push it past bound reports instead of taking it -- so a cyclic
+     * list is a finite false, not an infinite walk. */
+    while (cur != NULL) {
+        if (++n > bound) return false;
+        memcpy(&cur, cur, sizeof cur);
+    }
+
+    return n == p->free_count;
+}
+#endif
+
+/* Returns one slot to the pool. O(1), and indifferent to which slab the slot
+ * came from -- a single intrusive list is what buys that.
+ *
+ * CONTRACT, and it cannot be checked here: obj must be a pointer pool_alloc
+ * returned from this pool and not already freed. Verifying either would need
+ * a scan of the slabs or of the free list, which is exactly the O(1) the
+ * allocator exists to provide. A violation is undefined behavior at the point
+ * of the call; the debug cross-check above catches the double-free case
+ * shortly afterwards, at the next pool_stats, which is the best O(1) allows.
+ *
+ * The link lives in the first sizeof(void *) bytes of the slot. That is legal
+ * because the slot is dead (no live object's bytes are aliased), because the
+ * geometry's pointer floor guarantees stride >= sizeof(void *) so it cannot
+ * spill into the neighbour, and because every slot base is max_align_t
+ * aligned and so aligned for void *. It is written with memcpy rather than
+ * through a cast: these bytes were last written as some caller's object and
+ * are now read as a void *, which is a type-punned access a cast would make
+ * the compiler's business and memcpy does not. At -O1 it is one store. */
+void pool_free(rb_pool_t *p, void *obj)
+{
+    assert(p != NULL && obj != NULL);
+    assert(p->live > 0); /* nothing is live, so obj cannot have come from here */
+
+#ifndef NDEBUG
+    /* Poison FIRST, then write the link over the front. The reverse order
+     * overwrites the link with 0xDD and corrupts the list -- the next
+     * pool_alloc would return 0xDDDDDDDDDDDDDDDD as a slot address. The full
+     * stride is poisoned, not obj_size: the inter-slot padding belongs to the
+     * dead slot too, and a stale read can land in it just as easily. */
+    memset(obj, RB_POOL_POISON, p->stride);
+#endif
+
+    memcpy(obj, &p->free_head, sizeof p->free_head);
+    p->free_head = obj;
+    p->free_count++;
+    p->live--;
+}
+
 /* Reports the three numbers the M2 invariant is stated over. O(1): every one
  * is a maintained counter, or a sum of two. p and all three out-parameters
- * must be non-NULL. (The debug cross-check that keeps free_count honest
- * against a bounded walk of the free list lands with the free list itself.) */
+ * must be non-NULL. In a debug build it also cross-checks free_count against
+ * a bounded walk of the free list, which is what keeps the invariant from
+ * being a statement about its own operands. */
 void pool_stats(const rb_pool_t *p, size_t *slabs_out, size_t *live_out, size_t *free_objs_out)
 {
     assert(p != NULL && slabs_out != NULL && live_out != NULL && free_objs_out != NULL);
+    assert(pool_free_list_agrees(p)); /* debug-only; see the comment on it */
 
     *slabs_out     = p->slab_count;
     *live_out      = p->live;

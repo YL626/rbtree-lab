@@ -36,6 +36,7 @@ extern bool rb_pool_geometry(size_t obj_size, size_t *stride, size_t *slot0_offs
 typedef struct rb_pool rb_pool_t;
 extern rb_pool_t *pool_create(size_t obj_size);
 extern void      *pool_alloc(rb_pool_t *p);
+extern void       pool_free(rb_pool_t *p, void *obj);
 extern void       pool_stats(const rb_pool_t *p, size_t *slabs, size_t *live,
                              size_t *free_objs);
 extern void       pool_destroy(rb_pool_t *p);
@@ -1573,6 +1574,334 @@ static void test_pool_alloc_stride_is_not_obj_size(void) {
         pool_destroy(p);
     }
 }
+
+/* ---- Mutation 2 free list and poisoning (slice C: pool_free) ----
+ *
+ * With pool_free in place the invariant finally has non-zero terms on both
+ * sides, so live + free_objs == slabs * objs_per_slab stops being satisfiable
+ * by a pool where everything is zero.
+ */
+
+static bool in_set(const void *needle, void *const *set, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (set[i] == needle) return true;
+    return false;
+}
+
+static void test_pool_free_one_slot(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: free one] pool_create succeeds");
+    if (p == NULL) return;
+
+    void *slot = pool_alloc(p);
+    check(slot != NULL, "[pool: free one] allocation succeeds");
+    pool_free(p, slot);
+
+    size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 1, "[pool: free one] freeing a slot does not release its slab");
+    check(live == 0, "[pool: free one] nothing is live after the free");
+    check(free_objs == cap,
+          "[pool: free one] the freed slot plus the uncarved rest are all reusable");
+    check_pool_invariant(p, cap, "free one");
+
+    pool_destroy(p);
+}
+
+/* The ordering test. At this point the slab has 84 uncarved slots AND one
+ * slot on the free list, so returning the freed slot is a choice, not the
+ * only option -- which is what makes this an assertion about priority
+ * rather than about availability. */
+static void test_pool_free_reuse_before_carving(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: reuse first] pool_create succeeds");
+    if (p == NULL) return;
+
+    void *a = pool_alloc(p);
+    check(a != NULL, "[pool: reuse first] the first allocation succeeds");
+    pool_free(p, a);
+
+    size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(free_objs == cap, "[pool: reuse first] both a dead slot and uncarved slots are available");
+
+    void *b = pool_alloc(p);
+    check(b == a, "[pool: reuse first] the dead slot is reused before a fresh one is carved");
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 1 && live == 1 && free_objs == cap - 1,
+          "[pool: reuse first] reuse leaves one live slot and no extra slab");
+    check_pool_invariant(p, cap, "reuse first");
+
+    pool_destroy(p);
+}
+
+static void test_pool_free_is_lifo(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: lifo] pool_create succeeds");
+    if (p == NULL) return;
+
+    void *a = pool_alloc(p), *b = pool_alloc(p), *c = pool_alloc(p);
+    check(a != NULL && b != NULL && c != NULL, "[pool: lifo] three allocations succeed");
+    pool_free(p, a);
+    pool_free(p, b);
+    pool_free(p, c);
+
+    check(pool_alloc(p) == c, "[pool: lifo] the most recently freed slot comes back first");
+    check(pool_alloc(p) == b, "[pool: lifo] then the one freed before it");
+    check(pool_alloc(p) == a, "[pool: lifo] then the first one freed");
+    check_pool_invariant(p, cap, "lifo");
+
+    pool_destroy(p);
+}
+
+/* Reuse must cost nothing: no slab, and no rb_malloc at all. Measured as a
+ * delta so the claim does not depend on what earlier tests allocated. */
+static void test_pool_free_reuse_costs_no_allocation(void) {
+    size_t cap = pool_capacity();
+    const size_t k = 10;
+
+    fault_alloc_arm(100000); /* resets the counter; nothing here approaches it */
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: free reuse cost] pool_create succeeds");
+    if (p == NULL) { fault_alloc_disarm(); return; }
+
+    void *slots[POOL_TWO_SLABS];
+    size_t nulls = 0;
+    for (size_t i = 0; i < cap; i++)
+        if ((slots[i] = pool_alloc(p)) == NULL) nulls++;
+    check(nulls == 0, "[pool: free reuse cost] the first slab fills");
+
+    for (size_t i = 0; i < k; i++) pool_free(p, slots[i]);
+    check_pool_invariant(p, cap, "free reuse cost (after frees)");
+
+    long before = fault_alloc_total();
+    size_t off_list = 0;
+    for (size_t i = 0; i < k; i++) {
+        void *got = pool_alloc(p);
+        if (got == NULL || !in_set(got, slots, k)) off_list++;
+    }
+    long after = fault_alloc_total();
+
+    check(off_list == 0, "[pool: free reuse cost] every reallocated slot came from the freed set");
+    check(after - before == 0, "[pool: free reuse cost] reusing 10 slots costs zero rb_malloc calls");
+
+    size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 1 && live == cap && free_objs == 0,
+          "[pool: free reuse cost] the pool is back to one full slab");
+    check_pool_invariant(p, cap, "free reuse cost");
+
+    fault_alloc_disarm();
+    pool_destroy(p);
+}
+
+/* Once the free list is exhausted, allocation falls through to carving --
+ * and still does not allocate, because the slab has uncarved capacity. */
+static void test_pool_free_spills_to_carving(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: spill] pool_create succeeds");
+    if (p == NULL) return;
+
+    void *first[5];
+    size_t nulls = 0;
+    for (size_t i = 0; i < 5; i++)
+        if ((first[i] = pool_alloc(p)) == NULL) nulls++;
+    check(nulls == 0, "[pool: spill] five allocations succeed");
+
+    pool_free(p, first[0]);
+    pool_free(p, first[1]);
+    pool_free(p, first[2]);
+
+    fault_alloc_arm(100000);
+    long before = fault_alloc_total();
+    check(pool_alloc(p) == first[2], "[pool: spill] free list drains LIFO: third free first");
+    check(pool_alloc(p) == first[1], "[pool: spill] then the second");
+    check(pool_alloc(p) == first[0], "[pool: spill] then the first");
+
+    void *fresh = pool_alloc(p);
+    check(fresh != NULL, "[pool: spill] the allocation past an empty free list succeeds");
+    check(!in_set(fresh, first, 5), "[pool: spill] it is a freshly carved slot, not a reused one");
+    check(fault_alloc_total() - before == 0,
+          "[pool: spill] draining the list and carving again cost zero rb_malloc calls");
+    fault_alloc_disarm();
+
+    check_pool_invariant(p, cap, "spill");
+    pool_destroy(p);
+}
+
+/* free_objs is free_count + carve_remaining, and until this slice only one
+ * of those terms could ever be non-zero -- so dropping either changed no
+ * observable. With one slot live, one dead, and the rest of the slab
+ * uncarved, both terms are non-zero and the literal below pins their sum. */
+static void test_pool_stats_free_objs_counts_both_terms(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: both terms] pool_create succeeds");
+    if (p == NULL) return;
+
+    void *a = pool_alloc(p);
+    void *b = pool_alloc(p);
+    check(a != NULL && b != NULL, "[pool: both terms] two allocations succeed");
+    pool_free(p, a);
+
+    size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 1, "[pool: both terms] one slab");
+    check(live == 1, "[pool: both terms] one slot live");
+    /* 1 slot on the free list + (cap - 2) never carved. */
+    check(free_objs == 1 + (cap - 2),
+          "[pool: both terms] free_objs counts the dead slot AND the uncarved remainder");
+    check_pool_invariant(p, cap, "both terms");
+
+    pool_destroy(p);
+}
+
+#ifndef NDEBUG
+/* Poisoning is gated on NDEBUG, so this test is too -- under -DNDEBUG there
+ * is nothing to observe and asserting 0xDD would be wrong rather than
+ * merely unchecked.
+ *
+ * This test deliberately reads a slot it has already freed. That is legal:
+ * the slot lives inside a slab that is still one live rb_malloc block, which
+ * is exactly why neither ASan nor valgrind can see a stale access here, and
+ * why the 0xDD fill is the only thing that makes such a read obvious. Two
+ * object sizes, so the second pins that the whole stride is poisoned rather
+ * than only the object's own bytes. */
+static void test_pool_free_poisons_dead_slot(void) {
+    static const struct { size_t obj_size, stride; } cases[] = {
+        { POOL_OBJ_SIZE, 48 },  /* stride == obj_size */
+        { 40,            48 },  /* stride > obj_size: 8 bytes of padding too */
+    };
+    char msg[256];
+
+    for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+        size_t stride = 0, slot0 = 0, objs = 0, slack = 0;
+        check(rb_pool_geometry(cases[c].obj_size, &stride, &slot0, &objs, &slack),
+              "[pool: poison] geometry accepts the object size");
+        snprintf(msg, sizeof msg, "[pool: poison] obj_size %zu has stride %zu",
+                 cases[c].obj_size, cases[c].stride);
+        check(stride == cases[c].stride, msg);
+
+        rb_pool_t *p = pool_create(cases[c].obj_size);
+        check(p != NULL, "[pool: poison] pool_create succeeds");
+        if (p == NULL) continue;
+
+        /* Two slots, so the second free writes a NON-NULL link and the test
+         * can tell poison-then-link from link-then-poison: if the poison
+         * landed last, the link would be 0xDD bytes and reuse would not
+         * return these two slots in order. */
+        unsigned char *a = pool_alloc(p);
+        unsigned char *b = pool_alloc(p);
+        check(a != NULL && b != NULL, "[pool: poison] two allocations succeed");
+        if (a == NULL || b == NULL) { pool_destroy(p); continue; }
+
+        /* Prefilled across the FULL STRIDE, not just obj_size. Prefilling only
+         * the object leaves the inter-slot padding holding recycled heap
+         * bytes, which in a run that has already poisoned thousands of slots
+         * are frequently 0xDD themselves -- so the check below would pass on
+         * leftovers rather than on this free's poisoning. Found by mutation:
+         * a memset of obj_size instead of stride escaped the suite entirely
+         * until this prefill covered the padding. Writing the padding is a
+         * deliberate white-box reach past the obj_size the pool promises its
+         * callers, legitimate here for the same reason reading a dead slot
+         * below is: this test is the pool's own. */
+        memset(a, 0x5A, stride);
+        memset(b, 0x5A, stride);
+        pool_free(p, a);
+        pool_free(p, b);
+
+        size_t unpoisoned = 0;
+        for (size_t i = sizeof(void *); i < stride; i++)
+            if (b[i] != 0xDD) unpoisoned++;
+        snprintf(msg, sizeof msg,
+                 "[pool: poison] bytes [%zu, %zu) of a dead slot are 0xDD (%zu are not)",
+                 sizeof(void *), stride, unpoisoned);
+        check(unpoisoned == 0, msg);
+
+        check(pool_alloc(p) == b, "[pool: poison] the link survived the poison (LIFO reuse works)");
+        check(pool_alloc(p) == a, "[pool: poison] and the slot it linked to comes back next");
+
+        pool_destroy(p);
+    }
+}
+#endif
+
+/* Everything out, everything back, nothing bought in between. */
+static void test_pool_free_full_cycle(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: cycle] pool_create succeeds");
+    if (p == NULL) return;
+
+    void *slots[POOL_TWO_SLABS];
+    size_t nulls = 0;
+    for (size_t i = 0; i < POOL_TWO_SLABS; i++)
+        if ((slots[i] = pool_alloc(p)) == NULL) nulls++;
+    check(nulls == 0, "[pool: cycle] two slabs' worth of allocations succeed");
+
+    for (size_t i = 0; i < POOL_TWO_SLABS; i++) {
+        pool_free(p, slots[i]);
+        check_pool_invariant(p, cap, "cycle (per free)");
+    }
+
+    size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 2, "[pool: cycle] freeing every slot releases no slab");
+    check(live == 0, "[pool: cycle] nothing is live");
+    check(free_objs == POOL_TWO_SLABS, "[pool: cycle] every slot in both slabs is reusable");
+    check_pool_invariant(p, cap, "cycle (empty)");
+
+    fault_alloc_arm(100000);
+    long before = fault_alloc_total();
+    void *again[POOL_TWO_SLABS];
+    size_t off_set = 0;
+    for (size_t i = 0; i < POOL_TWO_SLABS; i++) {
+        again[i] = pool_alloc(p);
+        if (again[i] == NULL || !in_set(again[i], slots, POOL_TWO_SLABS)) off_set++;
+    }
+    check(off_set == 0, "[pool: cycle] every slot handed out again came from the original set");
+    check(fault_alloc_total() - before == 0,
+          "[pool: cycle] refilling two slabs from the free list costs zero rb_malloc calls");
+    fault_alloc_disarm();
+
+    check_all_distinct(again, POOL_TWO_SLABS, "cycle");
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 2 && live == POOL_TWO_SLABS && free_objs == 0,
+          "[pool: cycle] back to two full slabs with no third bought");
+    check_pool_invariant(p, cap, "cycle (refilled)");
+
+    pool_destroy(p);
+}
+
+/* Teardown with all three slot states present at once: live, free-listed,
+ * and never carved. Leaks are adjudicated by make asan / make memcheck. */
+static void test_pool_destroy_with_populated_free_list(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: destroy-mixed] pool_create succeeds");
+    if (p == NULL) return;
+
+    void *slots[POOL_TWO_SLABS];
+    size_t nulls = 0;
+    for (size_t i = 0; i < cap + 10; i++) /* one full slab, ten slots into the next */
+        if ((slots[i] = pool_alloc(p)) == NULL) nulls++;
+    check(nulls == 0, "[pool: destroy-mixed] allocations across two slabs succeed");
+
+    for (size_t i = 0; i < 20; i++) pool_free(p, slots[i]);
+
+    size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 2 && live == cap + 10 - 20,
+          "[pool: destroy-mixed] live, free-listed and uncarved slots all present");
+    check_pool_invariant(p, cap, "destroy-mixed");
+
+    pool_destroy(p);
+    check(1, "[pool: destroy-mixed] pool_destroy over a populated free list did not crash");
+}
 #endif
 
 int main(void) {
@@ -1629,6 +1958,17 @@ int main(void) {
     test_pool_alloc_grow_failure_later_slab();
     test_pool_alloc_stride_is_not_obj_size();
     test_pool_destroy_with_live_objects();
+    test_pool_free_one_slot();
+    test_pool_free_reuse_before_carving();
+    test_pool_free_is_lifo();
+    test_pool_free_reuse_costs_no_allocation();
+    test_pool_free_spills_to_carving();
+    test_pool_stats_free_objs_counts_both_terms();
+#ifndef NDEBUG
+    test_pool_free_poisons_dead_slot();
+#endif
+    test_pool_free_full_cycle();
+    test_pool_destroy_with_populated_free_list();
 #endif
     printf(failures == 0 ? "\nAll tests passed.\n" : "\n%d test(s) FAILED.\n", failures);
     return failures == 0 ? 0 : 1;
