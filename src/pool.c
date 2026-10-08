@@ -1,11 +1,12 @@
 /* Mutation 2: slab pool allocator.
  *
- * Two slices live here so far: the slot geometry (the arithmetic that divides
- * one page-sized slab into aligned, fixed-size slots) and the pool lifecycle
- * (pool_create / pool_stats / pool_destroy). Nothing here yet carves a slot,
- * hands one out, poisons one, or links one onto a free list: pool_alloc,
- * pool_free, 0xDD debug poisoning and rb_create_pooled are later slices, and
- * a pool built today owns no slabs at all.
+ * Three slices live here so far: the slot geometry (the arithmetic that
+ * divides one page-sized slab into aligned, fixed-size slots), the pool
+ * lifecycle (pool_create / pool_stats / pool_destroy), and slab growth plus
+ * slot carving behind pool_alloc. Nothing here yet returns a slot to the
+ * pool: pool_free, the intrusive free list, 0xDD debug poisoning and
+ * rb_create_pooled are later slices, so a slot handed out today stays live
+ * until the whole pool is destroyed.
  *
  * Design decisions this encodes (full reasoning in NOTES.md's HW2 "Choices
  * left up to me" and DEVLOG.md 2026-10-06/2026-10-08):
@@ -204,6 +205,75 @@ rb_pool_t *pool_create(size_t obj_size)
     p->live            = 0;
 
     return p;
+}
+
+/* ------------------------------------------------------------------------
+ * SLICE B: slab growth and slot carving.
+ *
+ * Still absent: pool_free, the intrusive free list, and 0xDD debug poisoning.
+ * A carved slot therefore holds whatever rb_malloc left in it and is the
+ * caller's to initialize; and because nothing can be returned yet, live only
+ * ever rises.
+ */
+
+/* Buys one slab and makes it the carve head. Returns false having mutated
+ * NOTHING if the allocation fails -- which is what lets pool_alloc's failure
+ * path be a bare `return NULL` with no unwinding to do.
+ *
+ * Only ever called with the head slab fully carved: growing while the old
+ * head still had uncarved slots would strand them, since one cursor pair can
+ * only track one slab. That is the "slot lost on the floor" the invariant
+ * live + free_objs == slabs * objs_per_slab exists to catch, so it is
+ * asserted here rather than left as a comment. */
+static bool pool_grow(rb_pool_t *p)
+{
+    assert(p->carve_remaining == 0);
+
+    struct rb_slab *slab = rb_malloc(RB_SLAB_BYTES);
+    if (slab == NULL) return false;
+
+    slab->next         = p->slabs;   /* LIFO: the newest slab is the carve head */
+    p->slabs           = slab;
+    p->slab_count++;
+    p->carve_next      = (unsigned char *)slab + p->slot0_offset;
+    p->carve_remaining = p->objs_per_slab;
+    return true;
+}
+
+/* Returns one slot, or NULL if the pool must grow and cannot. O(1): no size
+ * search, no coalescing, and no object->slab lookup -- every decision was
+ * made once, in pool_create.
+ *
+ * The slot's bytes are uninitialized. p must be non-NULL.
+ *
+ * Order: uncarved capacity, then grow. SLICE C inserts the free-list pop
+ * ahead of both, which is where reuse-before-carving starts to matter; today
+ * free_head is permanently NULL, so that branch would be dead code and is
+ * not written yet.
+ *
+ * The one fallible step is the grow, and it happens before any counter is
+ * touched, so "a failed pool_alloc leaves the pool exactly as it was" holds
+ * by position rather than by undoing anything. */
+void *pool_alloc(rb_pool_t *p)
+{
+    assert(p != NULL);
+
+    if (p->carve_remaining == 0 && !pool_grow(p))
+        return NULL;
+
+    /* Invariant: carve_next addresses an uncarved slot whenever
+     * carve_remaining > 0, which the branch above has just guaranteed. The
+     * advance is unconditional, so the cursor stays monotone; after the last
+     * slot of a slab it holds the slab's one-past-the-end address when
+     * slack == 0, which is a legal pointer value that is never dereferenced
+     * because carve_remaining == 0 gates every read of it, and the next grow
+     * resets it into a fresh slab. */
+    void *slot = p->carve_next;
+    p->carve_remaining--;
+    p->carve_next += p->stride;
+    p->live++;
+
+    return slot;
 }
 
 /* Reports the three numbers the M2 invariant is stated over. O(1): every one

@@ -35,6 +35,7 @@ extern bool rb_pool_geometry(size_t obj_size, size_t *stride, size_t *slot0_offs
  * pool_alloc and pool_free do not exist yet and are absent on purpose. */
 typedef struct rb_pool rb_pool_t;
 extern rb_pool_t *pool_create(size_t obj_size);
+extern void      *pool_alloc(rb_pool_t *p);
 extern void       pool_stats(const rb_pool_t *p, size_t *slabs, size_t *live,
                              size_t *free_objs);
 extern void       pool_destroy(rb_pool_t *p);
@@ -1161,6 +1162,417 @@ static void test_pool_lifecycle_at_geometry_extremes(void) {
         pool_destroy(p);
     }
 }
+
+/* ---- Mutation 2 slab growth and carving (slice B: pool_alloc) ----
+ *
+ * pool_free does not exist yet, so every slot handed out here stays live
+ * until pool_destroy. That makes the scenarios below purely monotone: live
+ * only rises, free_objs only falls (except where a new slab resets it), and
+ * nothing can come back to be reused.
+ */
+
+/* One slab's worth of slots, twice over -- enough to cross a slab boundary
+ * and fill the second one. A constant expression, not a VLA. */
+#define POOL_TWO_SLABS (2 * POOL_OBJS_PER_SLAB)
+
+/* Reads back the geometry the carve arithmetic is checked against. Pinned by
+ * pool_capacity()'s hand-worked literal, as everywhere else in these tests. */
+static size_t pool_stride(void) {
+    size_t stride = 0, slot0 = 0, objs = 0, slack = 0;
+    check(rb_pool_geometry(POOL_OBJ_SIZE, &stride, &slot0, &objs, &slack),
+          "[pool] geometry accepts the object size the carving tests use");
+    return stride;
+}
+
+/* One aggregated assertion rather than n^2 of them: pointer-distinctness
+ * over a whole run of allocations. Equality comparison between unrelated
+ * pointers is well defined, so this is safe across slab boundaries in a way
+ * that pointer subtraction would not be. */
+static void check_all_distinct(void *const *slots, size_t n, const char *label) {
+    char msg[256];
+    size_t collisions = 0;
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = i + 1; j < n; j++)
+            if (slots[i] == slots[j]) collisions++;
+    snprintf(msg, sizeof msg, "[pool: %s] all %zu slots are distinct addresses (%zu collisions)",
+             label, n, collisions);
+    check(collisions == 0, msg);
+}
+
+static void check_all_aligned(void *const *slots, size_t n, const char *label) {
+    char msg[256];
+    size_t misaligned = 0;
+    for (size_t i = 0; i < n; i++)
+        if ((uintptr_t)slots[i] % alignof(max_align_t) != 0) misaligned++;
+    snprintf(msg, sizeof msg, "[pool: %s] all %zu slots are max_align_t-aligned (%zu are not)",
+             label, n, misaligned);
+    check(misaligned == 0, msg);
+}
+
+static void test_pool_alloc_first_slot(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: first] pool_create succeeds");
+    if (p == NULL) return;
+
+    void *slot = pool_alloc(p);
+    check(slot != NULL, "[pool: first] the first pool_alloc returns a slot");
+    check((uintptr_t)slot % alignof(max_align_t) == 0,
+          "[pool: first] the first slot is max_align_t-aligned");
+
+    size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 1, "[pool: first] the first allocation buys exactly one slab");
+    check(live == 1, "[pool: first] one slot is live");
+    check(free_objs == cap - 1, "[pool: first] the rest of the slab is reported as free");
+    check_pool_invariant(p, cap, "first");
+
+    pool_destroy(p);
+}
+
+/* The core carving test. Within one slab the slot addresses are observable
+ * and must be exactly stride apart and ascending -- that is what pins the
+ * arithmetic, far more tightly than distinctness alone. Then the slot after
+ * the last one must come from a NEW slab rather than from the tail slack,
+ * which is the off-by-one the spec's own M2 review prompt names. */
+static void test_pool_alloc_fills_one_slab_then_grows(void) {
+    size_t cap = pool_capacity();
+    size_t stride = pool_stride();
+    char msg[256];
+
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: fill] pool_create succeeds");
+    if (p == NULL) return;
+
+    void *slots[POOL_TWO_SLABS];
+    size_t nulls = 0;
+    for (size_t i = 0; i < cap; i++) {
+        slots[i] = pool_alloc(p);
+        if (slots[i] == NULL) nulls++;
+        check_pool_invariant(p, cap, "fill (per allocation)");
+    }
+    snprintf(msg, sizeof msg, "[pool: fill] all %zu allocations in the first slab succeed", cap);
+    check(nulls == 0, msg);
+    if (nulls != 0) { pool_destroy(p); return; }
+
+    /* Same slab, so pointer subtraction between these is well defined. */
+    size_t bad_steps = 0;
+    for (size_t i = 1; i < cap; i++)
+        if ((unsigned char *)slots[i] - (unsigned char *)slots[i - 1] != (ptrdiff_t)stride)
+            bad_steps++;
+    snprintf(msg, sizeof msg,
+             "[pool: fill] consecutive slots in a slab are exactly stride (%zu) apart and "
+             "ascending (%zu bad steps)", stride, bad_steps);
+    check(bad_steps == 0, msg);
+
+    check_all_aligned(slots, cap, "fill");
+
+    size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 1, "[pool: fill] a full slab is still exactly one slab");
+    check(live == cap, "[pool: fill] every slot in the slab is live");
+    check(free_objs == 0, "[pool: fill] a full slab reports no reusable slots");
+    check_pool_invariant(p, cap, "fill");
+
+    /* The 86th: must buy a slab, NOT hand out the tail slack. */
+    slots[cap] = pool_alloc(p);
+    check(slots[cap] != NULL, "[pool: cross] the allocation past a full slab succeeds");
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 2, "[pool: cross] crossing a full slab buys a second slab");
+    check(live == cap + 1, "[pool: cross] the new slot is live");
+    check(free_objs == cap - 1, "[pool: cross] the new slab's remaining slots are free");
+    check_pool_invariant(p, cap, "cross");
+    check_all_distinct(slots, cap + 1, "cross");
+
+    /* Fill the second slab too: it must yield exactly cap slots as well. */
+    nulls = 0;
+    for (size_t i = cap + 1; i < POOL_TWO_SLABS; i++) {
+        slots[i] = pool_alloc(p);
+        if (slots[i] == NULL) nulls++;
+    }
+    check(nulls == 0, "[pool: two slabs] the second slab fills without failure");
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 2, "[pool: two slabs] two full slabs, no third bought");
+    check(live == POOL_TWO_SLABS, "[pool: two slabs] every slot in both slabs is live");
+    check(free_objs == 0, "[pool: two slabs] two full slabs report no reusable slots");
+    check_pool_invariant(p, cap, "two slabs");
+    check_all_distinct(slots, POOL_TWO_SLABS, "two slabs");
+    check_all_aligned(slots, POOL_TWO_SLABS, "two slabs");
+
+    pool_destroy(p);
+}
+
+/* The point of a slab allocator: object count does not drive allocation
+ * count. Measured as a delta across the run rather than against an absolute
+ * total, so the claim does not depend on what any earlier test allocated. */
+static void test_pool_alloc_one_malloc_per_slab(void) {
+    size_t cap = pool_capacity();
+
+    fault_alloc_arm(100000); /* resets the counter; nothing here comes near 100000 */
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: malloc count] pool_create succeeds with the injector idle");
+    if (p == NULL) { fault_alloc_disarm(); return; }
+
+    long before = fault_alloc_total();
+    size_t nulls = 0;
+    for (size_t i = 0; i < cap; i++)
+        if (pool_alloc(p) == NULL) nulls++;
+    long after_first_slab = fault_alloc_total();
+
+    check(nulls == 0, "[pool: malloc count] filling the first slab succeeds");
+    check(after_first_slab - before == 1,
+          "[pool: malloc count] filling a whole slab costs exactly one rb_malloc");
+
+    check(pool_alloc(p) != NULL, "[pool: malloc count] the allocation past the slab succeeds");
+    check(fault_alloc_total() - after_first_slab == 1,
+          "[pool: malloc count] crossing into a second slab costs exactly one more rb_malloc");
+
+    fault_alloc_disarm();
+    pool_destroy(p);
+}
+
+/* Distinct pointers are not enough: if the stride were smaller than the
+ * object, adjacent slots would overlap while still having distinct
+ * addresses. Writing a per-slot pattern across every byte of every slot and
+ * reading them all back afterwards is what actually detects that. */
+static void test_pool_alloc_slots_do_not_overlap(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: overlap] pool_create succeeds");
+    if (p == NULL) return;
+
+    unsigned char *slots[POOL_TWO_SLABS];
+    size_t nulls = 0;
+    for (size_t i = 0; i < POOL_TWO_SLABS; i++) {
+        slots[i] = pool_alloc(p);
+        if (slots[i] == NULL) { nulls++; continue; }
+        memset(slots[i], (unsigned char)(i + 1), POOL_OBJ_SIZE);
+    }
+    check(nulls == 0, "[pool: overlap] two slabs' worth of allocations succeed");
+
+    size_t corrupted = 0;
+    for (size_t i = 0; i < POOL_TWO_SLABS; i++) {
+        if (slots[i] == NULL) continue;
+        for (size_t b = 0; b < POOL_OBJ_SIZE; b++)
+            if (slots[i][b] != (unsigned char)(i + 1)) { corrupted++; break; }
+    }
+    check(corrupted == 0,
+          "[pool: overlap] every slot's full object_size bytes survive writes to every other slot");
+    check_pool_invariant(p, cap, "overlap");
+
+    pool_destroy(p);
+}
+
+/* The degenerate geometry: one slot per slab, so every single allocation
+ * must buy a slab and free_objs is never anything but zero. */
+static void test_pool_alloc_single_slot_geometry(void) {
+    size_t stride = 0, slot0 = 0, objs = 0, slack = 0;
+    check(rb_pool_geometry(4080, &stride, &slot0, &objs, &slack),
+          "[pool: one-per-slab] geometry accepts a 4080-byte object");
+    check(objs == 1, "[pool: one-per-slab] a 4080-byte object leaves exactly one slot per slab");
+
+    rb_pool_t *p = pool_create(4080);
+    check(p != NULL, "[pool: one-per-slab] pool_create succeeds");
+    if (p == NULL) return;
+
+    char msg[256];
+    for (size_t i = 1; i <= 3; i++) {
+        check(pool_alloc(p) != NULL, "[pool: one-per-slab] allocation succeeds");
+        size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+        pool_stats(p, &slabs, &live, &free_objs);
+        snprintf(msg, sizeof msg,
+                 "[pool: one-per-slab] allocation %zu leaves %zu slabs / %zu live / 0 free",
+                 i, i, i);
+        check(slabs == i && live == i && free_objs == 0, msg);
+        check_pool_invariant(p, objs, "one-per-slab");
+    }
+
+    pool_destroy(p);
+}
+
+/* Growth is the only fallible step in pool_alloc, and this is the stronger
+ * test site that choosing a lazy first slab bought: the FIRST slab's
+ * allocation can be injected to fail on a pool that already exists, so the
+ * assertion is not just "NULL" but "unchanged, and still usable afterwards".
+ * An eager pool could only have failed this at birth. */
+static void test_pool_alloc_grow_failure_first_slab(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: grow-fail first] pool_create succeeds before arming");
+    if (p == NULL) return;
+
+    fault_alloc_arm(1);
+    void *slot = pool_alloc(p);
+    check(slot == NULL, "[pool: grow-fail first] pool_alloc returns NULL when the slab fails");
+    check(fault_alloc_total() == 1,
+          "[pool: grow-fail first] exactly one allocation was attempted");
+    fault_alloc_disarm();
+
+    size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 0 && live == 0 && free_objs == 0,
+          "[pool: grow-fail first] the pool is untouched by the failed allocation");
+    check_pool_invariant(p, cap, "grow-fail first");
+
+    slot = pool_alloc(p);
+    check(slot != NULL, "[pool: grow-fail first] the pool still works once disarmed");
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 1 && live == 1 && free_objs == cap - 1,
+          "[pool: grow-fail first] the retry produces normal stats");
+    check_pool_invariant(p, cap, "grow-fail first retry");
+
+    pool_destroy(p);
+}
+
+/* The same failure one slab in, where there is real state to preserve: a
+ * full slab, a live count of cap, and an exhausted carve cursor. */
+static void test_pool_alloc_grow_failure_later_slab(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: grow-fail later] pool_create succeeds");
+    if (p == NULL) return;
+
+    size_t nulls = 0;
+    for (size_t i = 0; i < cap; i++)
+        if (pool_alloc(p) == NULL) nulls++;
+    check(nulls == 0, "[pool: grow-fail later] the first slab fills before arming");
+
+    fault_alloc_arm(1);
+    void *slot = pool_alloc(p);
+    check(slot == NULL, "[pool: grow-fail later] pool_alloc returns NULL when the slab fails");
+    fault_alloc_disarm();
+
+    size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 1 && live == cap && free_objs == 0,
+          "[pool: grow-fail later] the full slab and its counters are untouched");
+    check_pool_invariant(p, cap, "grow-fail later");
+
+    slot = pool_alloc(p);
+    check(slot != NULL, "[pool: grow-fail later] the pool still grows once disarmed");
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 2 && live == cap + 1 && free_objs == cap - 1,
+          "[pool: grow-fail later] the retry buys the second slab");
+    check_pool_invariant(p, cap, "grow-fail later retry");
+
+    pool_destroy(p);
+}
+
+/* pool_destroy with every slot still live, which is the case the design is
+ * built for: the pool owns slabs, not objects, so live slots are released
+ * wholesale with the slab that contains them. This is also the first
+ * scenario in which pool_destroy's chain walk actually runs -- the
+ * save-next-before-rb_free rule is unexercised until a pool owns slabs.
+ * The leak claim itself is adjudicated by make asan / make memcheck. */
+static void test_pool_destroy_with_live_objects(void) {
+    size_t cap = pool_capacity();
+
+    /* Two full slabs, nothing freed. */
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: destroy-live] pool_create succeeds");
+    if (p == NULL) return;
+    size_t nulls = 0;
+    for (size_t i = 0; i < POOL_TWO_SLABS; i++)
+        if (pool_alloc(p) == NULL) nulls++;
+    check(nulls == 0, "[pool: destroy-live] two full slabs of live slots");
+    check_pool_invariant(p, cap, "destroy-live");
+    pool_destroy(p);
+    check(1, "[pool: destroy-live] pool_destroy over two full slabs did not crash");
+
+    /* A partially carved head slab, so teardown covers the uncarved case too. */
+    p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: destroy-partial] pool_create succeeds");
+    if (p == NULL) return;
+    nulls = 0;
+    for (size_t i = 0; i < cap + 1; i++)
+        if (pool_alloc(p) == NULL) nulls++;
+    check(nulls == 0, "[pool: destroy-partial] one full slab plus one slot of the next");
+    check_pool_invariant(p, cap, "destroy-partial");
+    pool_destroy(p);
+    check(1, "[pool: destroy-partial] pool_destroy over a partly carved slab did not crash");
+}
+
+/* Found by mutation-testing slice B: every object size used above (48 and
+ * 4080) happens to have stride == obj_size, so a carve cursor advanced by
+ * obj_size instead of stride passed the whole suite. These two sizes have
+ * real internal padding, and the second also leaves tail slack, so between
+ * them they pin both "advance by the stride" and "the cursor's final
+ * position is inside the slack rather than one past the slab".
+ *
+ * Expected numbers are the hand-worked rows from geom_cases[], restated here
+ * rather than recomputed. */
+static void test_pool_alloc_stride_is_not_obj_size(void) {
+    static const struct {
+        size_t obj_size, stride, objs, slack;
+    } padded[] = {
+        { 40, 48,  85,  0 },  /* padding, no slack */
+        { 17, 32, 127, 16 },  /* padding and slack */
+    };
+    char msg[256];
+
+    for (size_t c = 0; c < sizeof padded / sizeof padded[0]; c++) {
+        size_t stride = 0, slot0 = 0, objs = 0, slack = 0;
+        check(rb_pool_geometry(padded[c].obj_size, &stride, &slot0, &objs, &slack),
+              "[pool: padded] geometry accepts the padded object size");
+        snprintf(msg, sizeof msg,
+                 "[pool: padded] obj_size %zu has stride %zu / %zu slots / %zu slack",
+                 padded[c].obj_size, padded[c].stride, padded[c].objs, padded[c].slack);
+        check(stride == padded[c].stride && objs == padded[c].objs && slack == padded[c].slack,
+              msg);
+
+        /* The premise: if these were equal the test below would prove nothing. */
+        snprintf(msg, sizeof msg, "[pool: padded] stride %zu differs from obj_size %zu",
+                 stride, padded[c].obj_size);
+        check(stride != padded[c].obj_size, msg);
+
+        rb_pool_t *p = pool_create(padded[c].obj_size);
+        snprintf(msg, sizeof msg, "[pool: padded] pool_create(%zu) succeeds", padded[c].obj_size);
+        check(p != NULL, msg);
+        if (p == NULL) continue;
+
+        void *slots[POOL_TWO_SLABS];
+        size_t nulls = 0;
+        for (size_t i = 0; i < objs; i++) {
+            slots[i] = pool_alloc(p);
+            if (slots[i] == NULL) nulls++;
+        }
+        snprintf(msg, sizeof msg, "[pool: padded] all %zu slots of the slab are handed out", objs);
+        check(nulls == 0, msg);
+
+        if (nulls == 0) {
+            size_t bad_steps = 0;
+            for (size_t i = 1; i < objs; i++)
+                if ((unsigned char *)slots[i] - (unsigned char *)slots[i - 1] != (ptrdiff_t)stride)
+                    bad_steps++;
+            snprintf(msg, sizeof msg,
+                     "[pool: padded] slots advance by stride %zu, not obj_size %zu (%zu bad steps)",
+                     stride, padded[c].obj_size, bad_steps);
+            check(bad_steps == 0, msg);
+            check_all_aligned(slots, objs, "padded");
+            check_all_distinct(slots, objs, "padded");
+        }
+
+        size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+        pool_stats(p, &slabs, &live, &free_objs);
+        snprintf(msg, sizeof msg,
+                 "[pool: padded] a full padded slab is 1 slab / %zu live / 0 free", objs);
+        check(slabs == 1 && live == objs && free_objs == 0, msg);
+        check_pool_invariant(p, objs, "padded");
+
+        /* The slack must not become an extra slot, and with slack > 0 this is
+         * also where the carve cursor sat inside the slack rather than at the
+         * slab's one-past-the-end address. */
+        check(pool_alloc(p) != NULL, "[pool: padded] the allocation past the slab succeeds");
+        pool_stats(p, &slabs, &live, &free_objs);
+        snprintf(msg, sizeof msg,
+                 "[pool: padded] the slack is not handed out: 2 slabs / %zu live / %zu free",
+                 objs + 1, objs - 1);
+        check(slabs == 2 && live == objs + 1 && free_objs == objs - 1, msg);
+        check_pool_invariant(p, objs, "padded cross");
+
+        pool_destroy(p);
+    }
+}
 #endif
 
 int main(void) {
@@ -1208,6 +1620,15 @@ int main(void) {
     test_pool_create_allocation_failure();
     test_pool_create_destroy_is_one_allocation();
     test_pool_lifecycle_at_geometry_extremes();
+    test_pool_alloc_first_slot();
+    test_pool_alloc_fills_one_slab_then_grows();
+    test_pool_alloc_one_malloc_per_slab();
+    test_pool_alloc_slots_do_not_overlap();
+    test_pool_alloc_single_slot_geometry();
+    test_pool_alloc_grow_failure_first_slab();
+    test_pool_alloc_grow_failure_later_slab();
+    test_pool_alloc_stride_is_not_obj_size();
+    test_pool_destroy_with_live_objects();
 #endif
     printf(failures == 0 ? "\nAll tests passed.\n" : "\n%d test(s) FAILED.\n", failures);
     return failures == 0 ? 0 : 1;
