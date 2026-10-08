@@ -1,12 +1,14 @@
 /* Mutation 2: slab pool allocator.
  *
- * THIS SLICE IS SLOT GEOMETRY ONLY -- the arithmetic that divides one
- * page-sized slab into aligned, fixed-size slots. Nothing here allocates,
- * carves, hands out, poisons, or frees a slab yet: pool_create, pool_alloc,
- * pool_free, pool_stats, pool_destroy and rb_create_pooled are later slices.
+ * Two slices live here so far: the slot geometry (the arithmetic that divides
+ * one page-sized slab into aligned, fixed-size slots) and the pool lifecycle
+ * (pool_create / pool_stats / pool_destroy). Nothing here yet carves a slot,
+ * hands one out, poisons one, or links one onto a free list: pool_alloc,
+ * pool_free, 0xDD debug poisoning and rb_create_pooled are later slices, and
+ * a pool built today owns no slabs at all.
  *
  * Design decisions this encodes (full reasoning in NOTES.md's HW2 "Choices
- * left up to me" and DEVLOG.md 2026-10-06/2026-10-07):
+ * left up to me" and DEVLOG.md 2026-10-06/2026-10-08):
  *
  *   - Slots are aligned to alignof(max_align_t), i.e. fundamental alignment.
  *     A slot's bytes are used two ways across its lifetime -- the live object
@@ -23,6 +25,8 @@
  *     alignment padding, and objs_per_slab must be derived from what is left
  *     -- not from 4096, which is the off-by-one this file exists to get right.
  */
+#include "fault_alloc.h"
+#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -102,4 +106,143 @@ bool rb_pool_geometry(size_t obj_size, size_t *stride_out, size_t *slot0_offset_
     *objs_per_slab_out = objs;
     *slack_out         = usable - objs * stride;
     return true;
+}
+
+/* ------------------------------------------------------------------------
+ * SLICE A: pool_create / pool_stats / pool_destroy.
+ *
+ * Still absent, deliberately: pool_alloc, pool_free, slab carving, the
+ * intrusive free list, 0xDD debug poisoning, the debug free-list cross-check
+ * walk, and rb_create_pooled. A pool built here therefore owns no slabs and
+ * can hand out nothing; what it does is cache its geometry, report honest
+ * zeroes, and tear down.
+ *
+ * Decisions this encodes (reasoning in NOTES.md / DEVLOG.md 2026-10-08):
+ *
+ *   - LAZY first slab. pool_create buys no slab, so it has exactly one
+ *     fallible allocation and therefore no unwind path at all. The "no
+ *     capacity, grow" branch pool_alloc needs for slab 2 is the same branch
+ *     it needs for slab 1, so eager allocation would have bought nothing in
+ *     alloc-side simplicity in exchange for a second failure path here. It
+ *     also moves first-slab-allocation-failure to a stronger test site: a
+ *     pool_alloc that must return NULL, leave every counter untouched, and
+ *     still work once the injector is disarmed.
+ *
+ *   - Geometry is computed ONCE, here, and cached. pool_alloc/pool_free must
+ *     be O(1) and must not divide or round; and rb_pool_geometry's false
+ *     return gets checked at exactly one site in the program.
+ *
+ *   - Preconditions, not guarantees: pool_stats and pool_destroy require a
+ *     non-NULL pool, and pool_stats requires all three out-parameters. These
+ *     are asserted, not branched on -- the pool is internal to this file and
+ *     owes callers no NULL-tolerance that the assignment does not ask for.
+ */
+
+typedef struct rb_pool rb_pool_t;
+
+struct rb_pool {
+    /* Geometry, fixed at pool_create and read-only afterwards. objs_per_slab
+     * is stored rather than recomputed because it is the right-hand side of
+     * the live + free_objs == slabs * objs_per_slab invariant: re-deriving it
+     * at check time would let a geometry bug cancel out of its own check. */
+    size_t obj_size;
+    size_t stride;
+    size_t slot0_offset;
+    size_t objs_per_slab;
+
+    /* Slab chain, newest first. Only pool_destroy reads it; nothing on the
+     * alloc/free path needs to know which slab a slot came from, which is
+     * what keeps those paths O(1). */
+    struct rb_slab *slabs;
+    size_t          slab_count;
+
+    /* Carve state. One cursor pair is enough because every slab except the
+     * head is fully carved -- growth happens only when carve_remaining == 0.
+     * Growing earlier would strand the old head's uncarved slots, which is
+     * exactly the "slot lost on the floor" the invariant exists to catch. */
+    unsigned char *carve_next;
+    size_t         carve_remaining;
+
+    /* Free list of dead slots, threaded through the slots themselves.
+     * free_count is the list's length only; free_objs as the spec defines it
+     * (what pool_alloc can return without calling rb_malloc) is
+     * free_count + carve_remaining, summed in pool_stats. */
+    void   *free_head;
+    size_t  free_count;
+
+    size_t live;
+};
+
+/* Returns NULL if obj_size admits no complete slot (see rb_pool_geometry) or
+ * if the pool struct itself cannot be allocated. The geometry test runs
+ * BEFORE the allocation, so a rejected obj_size costs no rb_malloc call at
+ * all and there is nothing to release on that path. */
+rb_pool_t *pool_create(size_t obj_size)
+{
+    size_t stride, slot0_offset, objs_per_slab, slack;
+
+    if (!rb_pool_geometry(obj_size, &stride, &slot0_offset, &objs_per_slab, &slack))
+        return NULL;
+
+    rb_pool_t *p = rb_malloc(sizeof *p);
+    if (p == NULL) return NULL;
+
+    p->obj_size      = obj_size;
+    p->stride        = stride;
+    p->slot0_offset  = slot0_offset;
+    p->objs_per_slab = objs_per_slab;
+    /* slack is geometry's fourth output and the pool has no use for it: "is
+     * there room for another slot" is answered by carve_remaining, never by
+     * arithmetic against the slab end. Asserted in the geometry test instead. */
+
+    p->slabs           = NULL;
+    p->slab_count      = 0;
+    p->carve_next      = NULL;
+    p->carve_remaining = 0;
+    p->free_head       = NULL;
+    p->free_count      = 0;
+    p->live            = 0;
+
+    return p;
+}
+
+/* Reports the three numbers the M2 invariant is stated over. O(1): every one
+ * is a maintained counter, or a sum of two. p and all three out-parameters
+ * must be non-NULL. (The debug cross-check that keeps free_count honest
+ * against a bounded walk of the free list lands with the free list itself.) */
+void pool_stats(const rb_pool_t *p, size_t *slabs_out, size_t *live_out, size_t *free_objs_out)
+{
+    assert(p != NULL && slabs_out != NULL && live_out != NULL && free_objs_out != NULL);
+
+    *slabs_out     = p->slab_count;
+    *live_out      = p->live;
+    *free_objs_out = p->free_count + p->carve_remaining;
+}
+
+/* Releases every slab and the pool itself. Live objects are not an obstacle:
+ * the pool owns slabs, not objects, and one rb_free of a slab reclaims all of
+ * its slots at once whether they were live, free-listed, or never carved.
+ *
+ * p must be non-NULL. Callers that may hold NULL check it themselves. */
+void pool_destroy(rb_pool_t *p)
+{
+    assert(p != NULL);
+
+    /* The chain link is in-band at the front of the very block being freed,
+     * so next must be read before the rb_free that invalidates it -- the HW1
+     * "save the pointer before you free the thing that contains it" rule, one
+     * level down. Invariant: slab is a slab not yet released. */
+    struct rb_slab *slab = p->slabs;
+    while (slab != NULL) {
+        struct rb_slab *next = slab->next;
+        rb_free(slab);
+        slab = next;
+    }
+
+    /* free_head and carve_next point INTO slabs and are dangling as of the
+     * loop above; they are deliberately not walked or cleared. There is
+     * nothing teardown needs from them, and reading one would be a real
+     * use-after-free rather than a stale-slot read ASan cannot see. */
+
+    rb_free(p);
 }

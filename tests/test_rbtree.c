@@ -27,6 +27,17 @@ extern void rb_test_bump_size(rbtree_t *t);
  * declares it. */
 extern bool rb_pool_geometry(size_t obj_size, size_t *stride, size_t *slot0_offset,
                              size_t *objs_per_slab, size_t *slack);
+
+/* Also src/pool.c (Mutation 2 pool lifecycle, slice A). Declared here for the
+ * same reasons as the geometry helper above, with one addition: rb_pool_t is
+ * left INCOMPLETE. The tests need only the pointer type, so no struct layout
+ * is duplicated across the file boundary and none can drift out of step.
+ * pool_alloc and pool_free do not exist yet and are absent on purpose. */
+typedef struct rb_pool rb_pool_t;
+extern rb_pool_t *pool_create(size_t obj_size);
+extern void       pool_stats(const rb_pool_t *p, size_t *slabs, size_t *live,
+                             size_t *free_objs);
+extern void       pool_destroy(rb_pool_t *p);
 #endif
 
 static int failures = 0;
@@ -991,6 +1002,165 @@ static void test_pool_geometry_table(void) {
     size_t n = sizeof geom_cases / sizeof geom_cases[0];
     for (size_t i = 0; i < n; i++) run_geom_case(&geom_cases[i]);
 }
+
+/* ---- Mutation 2 pool lifecycle (slice A: create / stats / destroy) ----
+ *
+ * The pool owns no slabs yet and hands out nothing, so what is testable here
+ * is the lifecycle: what pool_create accepts and rejects, what it costs in
+ * rb_malloc calls, what an untouched pool reports, and that teardown leaks
+ * nothing. The alloc/free scenarios arrive with pool_alloc.
+ */
+
+/* The pool tests are written against one object size, pinned by hand rather
+ * than recomputed, so that a geometry change fails HERE rather than silently
+ * re-deriving a different capacity that the pool tests would then agree with.
+ * 48 is the current sizeof(struct rb_node), which is what rb_create_pooled
+ * will ask for; 85 is worked out by hand as (4096 - 16) / 48. */
+#define POOL_OBJ_SIZE      ((size_t)48)
+#define POOL_OBJS_PER_SLAB ((size_t)85)
+
+/* Fetches the capacity the invariant is stated over, asserting the pinned
+ * value on the way through. Using rb_pool_geometry here is not circular: its
+ * output is already nailed down independently by geom_cases[]'s hand-worked
+ * literals, and the check below pins the one number these tests consume. */
+static size_t pool_capacity(void) {
+    size_t stride = 0, slot0 = 0, objs = 0, slack = 0;
+    check(rb_pool_geometry(POOL_OBJ_SIZE, &stride, &slot0, &objs, &slack),
+          "[pool] geometry accepts the 48-byte object size the pool tests use");
+    check(objs == POOL_OBJS_PER_SLAB,
+          "[pool] one slab holds 85 slots of 48 bytes (hand-pinned capacity)");
+    return objs;
+}
+
+/* The M2 headline invariant. Called after every scenario, not once at the
+ * end: the earliest assertion failure is the informative one. Trivially true
+ * while every term is zero -- it becomes load-bearing in the carving slice,
+ * and it is here now so that no scenario is ever added without it. */
+static void check_pool_invariant(const rb_pool_t *p, size_t objs_per_slab, const char *label) {
+    char msg[256];
+    size_t slabs = 0, live = 0, free_objs = 0;
+    pool_stats(p, &slabs, &live, &free_objs);
+    snprintf(msg, sizeof msg,
+             "[pool: %s] live + free_objs == slabs * objs_per_slab (%zu + %zu == %zu * %zu)",
+             label, live, free_objs, slabs, objs_per_slab);
+    check(live + free_objs == slabs * objs_per_slab, msg);
+}
+
+/* A fresh pool reports honest zeroes, which is what "lazy" means observably:
+ * no slab has been bought, so there is no capacity to report yet. An eager
+ * pool would report 1/0/85 here instead, so this is the test that pins the
+ * decision rather than merely tolerating it. */
+static void test_pool_create_empty_stats(void) {
+    size_t cap = pool_capacity();
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: empty] pool_create succeeds for a 48-byte object");
+    if (p == NULL) return;
+
+    size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+    pool_stats(p, &slabs, &live, &free_objs);
+    check(slabs == 0, "[pool: empty] a fresh pool owns no slabs (lazy first slab)");
+    check(live == 0, "[pool: empty] a fresh pool has no live objects");
+    check(free_objs == 0, "[pool: empty] a fresh pool reports no reusable slots");
+    check_pool_invariant(p, cap, "empty");
+
+    pool_destroy(p);
+}
+
+/* An obj_size no complete slot can hold is rejected, and -- because the
+ * geometry test runs before the allocation -- rejected without spending an
+ * rb_malloc call. fault_alloc_arm(1) is what makes that observable: were the
+ * order reversed, the pool struct would be allocated and then thrown away,
+ * and fault_alloc_total() would read 1 instead of 0. */
+static void test_pool_create_rejects_unusable_obj_size(void) {
+    static const struct { const char *name; size_t obj_size; } bad[] = {
+        { "obj_size 0",         0            },
+        { "obj_size 4081",      4081         },
+        { "obj_size 4096",      4096         },
+        { "obj_size SIZE_MAX",  SIZE_MAX     },
+    };
+    char msg[256];
+
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        fault_alloc_arm(1);
+        rb_pool_t *p = pool_create(bad[i].obj_size);
+
+        snprintf(msg, sizeof msg, "[pool: reject] pool_create(%s) returns NULL", bad[i].name);
+        check(p == NULL, msg);
+
+        snprintf(msg, sizeof msg,
+                 "[pool: reject] pool_create(%s) allocates nothing (geometry checked first)",
+                 bad[i].name);
+        check(fault_alloc_total() == 0, msg);
+
+        fault_alloc_disarm();
+        if (p != NULL) pool_destroy(p); /* unexpected success -- do not leak it */
+    }
+}
+
+/* pool_create's single allocation, injected to fail. The total of exactly 1
+ * is the other half of the lazy decision: an eager pool would have attempted
+ * a second allocation for its first slab, so this count would be 2 on the
+ * success path and this test would have an unwind to check. There is none. */
+static void test_pool_create_allocation_failure(void) {
+    fault_alloc_arm(1);
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p == NULL, "[pool: create-fail] pool_create returns NULL when its allocation fails");
+    check(fault_alloc_total() == 1,
+          "[pool: create-fail] exactly one allocation was attempted before the failure");
+    fault_alloc_disarm();
+    if (p != NULL) pool_destroy(p); /* unexpected success -- do not leak it */
+}
+
+/* A whole create/destroy cycle costs exactly one rb_malloc, and leaks
+ * nothing. The arm(1000) is only there to zero the since-arm counter -- no
+ * scenario here comes close to 1000 allocations, so nothing is injected.
+ * The leak half of this claim is adjudicated by make asan / make memcheck,
+ * not by an assertion in this file. */
+static void test_pool_create_destroy_is_one_allocation(void) {
+    size_t cap = pool_capacity();
+    fault_alloc_arm(1000);
+    rb_pool_t *p = pool_create(POOL_OBJ_SIZE);
+    check(p != NULL, "[pool: lifecycle] pool_create succeeds with the injector idle");
+    if (p == NULL) { fault_alloc_disarm(); return; }
+
+    check(fault_alloc_total() == 1,
+          "[pool: lifecycle] a successful pool_create is exactly one rb_malloc (no slab bought)");
+    check_pool_invariant(p, cap, "lifecycle");
+
+    pool_destroy(p);
+    check(fault_alloc_total() == 1,
+          "[pool: lifecycle] pool_destroy on a slab-less pool allocates nothing");
+    fault_alloc_disarm();
+}
+
+/* Smallest and largest object sizes geometry accepts both survive a full
+ * lifecycle, and both report the same honest zeroes -- the stats of an
+ * untouched pool do not depend on its geometry. */
+static void test_pool_lifecycle_at_geometry_extremes(void) {
+    static const size_t sizes[] = { 1, 8, 4080 };
+    char msg[256];
+
+    for (size_t i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+        size_t stride = 0, slot0 = 0, objs = 0, slack = 0;
+        check(rb_pool_geometry(sizes[i], &stride, &slot0, &objs, &slack),
+              "[pool: extremes] geometry accepts the size under test");
+
+        rb_pool_t *p = pool_create(sizes[i]);
+        snprintf(msg, sizeof msg, "[pool: extremes] pool_create(%zu) succeeds", sizes[i]);
+        check(p != NULL, msg);
+        if (p == NULL) continue;
+
+        size_t slabs = 0xBAD, live = 0xBAD, free_objs = 0xBAD;
+        pool_stats(p, &slabs, &live, &free_objs);
+        snprintf(msg, sizeof msg,
+                 "[pool: extremes] pool_create(%zu) starts at 0 slabs / 0 live / 0 free",
+                 sizes[i]);
+        check(slabs == 0 && live == 0 && free_objs == 0, msg);
+        check_pool_invariant(p, objs, "extremes");
+
+        pool_destroy(p);
+    }
+}
 #endif
 
 int main(void) {
@@ -1033,6 +1203,11 @@ int main(void) {
     test_fault_sweep();
 #ifdef RBTREE_TEST_HOOKS
     test_pool_geometry_table();
+    test_pool_create_empty_stats();
+    test_pool_create_rejects_unusable_obj_size();
+    test_pool_create_allocation_failure();
+    test_pool_create_destroy_is_one_allocation();
+    test_pool_lifecycle_at_geometry_extremes();
 #endif
     printf(failures == 0 ? "\nAll tests passed.\n" : "\n%d test(s) FAILED.\n", failures);
     return failures == 0 ? 0 : 1;
