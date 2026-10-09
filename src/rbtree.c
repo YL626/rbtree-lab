@@ -5,6 +5,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Mutation 2 pool entry points, defined in src/pool.c. Declared here rather
+ * than in a src/pool.h: the spec's file map is fixed, and tests/test_rbtree.c
+ * already declares these the same way under RBTREE_TEST_HOOKS. rb_pool_t is
+ * left INCOMPLETE on purpose -- the tree logic only ever holds a pointer, so
+ * no pool layout is visible here and none can drift out of step. */
+typedef struct rb_pool rb_pool_t;
+extern rb_pool_t *pool_create(size_t obj_size);
+extern void      *pool_alloc(rb_pool_t *p);
+extern void       pool_free(rb_pool_t *p, void *obj);
+extern void       pool_destroy(rb_pool_t *p);
+
 typedef enum { RED, BLACK } rb_color_t;
 
 struct rb_node {
@@ -20,10 +31,35 @@ struct rbtree {
     struct rb_node   *root;
     size_t            size;
     rb_value_free_fn  value_free;
+    /* NULL => ordinary rb_malloc node storage; non-NULL => node storage drawn
+     * from this slab pool. NULL *is* the mode discriminator: no flag, no
+     * second struct, and every mode-dependent decision in this file is made
+     * inside node_alloc/node_release and rb_destroy's teardown branch. */
+    rb_pool_t        *pool;
 };
 
 static bool is_red(const struct rb_node *n)  { return n != NULL && n->color == RED; }
 static bool is_black(const struct rb_node *n) { return !is_red(n); }
+
+/* The single point where node storage is obtained and returned. Centralizing
+ * them is what keeps rb_insert/rb_delete free of mode-specific branches: both
+ * call these and neither knows which allocator is underneath.
+ *
+ * Only NODE storage is pooled. Key copies are variable-length and stay on the
+ * rb_malloc/rb_free seam -- a fixed-stride slot pool cannot hold them.
+ *
+ * node_release is deliberately NOT used by rb_destroy's whole-tree teardown:
+ * see the comment there. It exists for rb_delete and for rb_insert's rollback
+ * when the key copy fails after a slot has already been taken. */
+static struct rb_node *node_alloc(rbtree_t *t) {
+    if (t->pool != NULL) return pool_alloc(t->pool);
+    return rb_malloc(sizeof(struct rb_node));
+}
+
+static void node_release(rbtree_t *t, struct rb_node *n) {
+    if (t->pool != NULL) pool_free(t->pool, n);
+    else                 rb_free(n);
+}
 
 rbtree_t *rb_create(rb_value_free_fn value_free) {
     rbtree_t *t = rb_malloc(sizeof *t);
@@ -31,6 +67,33 @@ rbtree_t *rb_create(rb_value_free_fn value_free) {
     t->root = NULL;
     t->size = 0;
     t->value_free = value_free;
+    t->pool = NULL;
+    return t;
+}
+
+/* Mutation 2: a tree whose NODES come from an internal slab pool. Everything
+ * else -- the tree handle itself, and every key copy -- still goes through
+ * rb_malloc, since neither is a fixed-size object the pool could hold.
+ *
+ * Two fallible steps, and the order is chosen so there is exactly one thing
+ * to unwind: the handle first (nothing held if it fails), then the pool
+ * (release the handle if it fails). pool_create is itself all-or-nothing --
+ * it validates the geometry before its single rb_malloc -- so there is never
+ * a half-built pool to dismantle, and no goto-cleanup ladder is warranted.
+ *
+ * rb_free(t) rather than rb_destroy(t) on the pool-create failure path: t is
+ * an empty tree whose pool field rb_create has already set to NULL, so
+ * rb_destroy would be correct, but rb_free says plainly that nothing has been
+ * built yet and cannot be misread as teardown of a populated tree. */
+rbtree_t *rb_create_pooled(rb_value_free_fn value_free) {
+    rbtree_t *t = rb_create(value_free);
+    if (t == NULL) return NULL;
+
+    t->pool = pool_create(sizeof(struct rb_node));
+    if (t->pool == NULL) {
+        rb_free(t);
+        return NULL;
+    }
     return t;
 }
 
@@ -130,13 +193,17 @@ int rb_insert(rbtree_t *t, const char *key, void *value) {
         cur = (cmp < 0) ? cur->left : cur->right;
     }
 
-    struct rb_node *n = rb_malloc(sizeof *n);
+    struct rb_node *n = node_alloc(t);
     if (n == NULL) return -1;
 
     size_t keylen = strlen(key) + 1;
     n->key = rb_malloc(keylen);
     if (n->key == NULL) {
-        rb_free(n);
+        /* Rollback: the slot goes straight back, so a pooled tree's
+         * live + free_objs == slabs * objs_per_slab still holds across the
+         * failure. n->value was never assigned and the caller still owns the
+         * value it passed in. */
+        node_release(t, n);
         return -1;
     }
     memcpy(n->key, key, keylen);
@@ -276,7 +343,7 @@ int rb_delete(rbtree_t *t, const char *key) {
         rb_free(n->key);
         if (t->value_free) t->value_free(n->value);
     }
-    rb_free(n);
+    node_release(t, n);
     t->size--;
     return 0;
 }
@@ -367,6 +434,29 @@ int rb_validate(const rbtree_t *t) {
     return 0;
 }
 
+/* Teardown. The right-spine "Reach" walk is unchanged; the only mode-dependent
+ * part is who reclaims node storage.
+ *
+ * Ordinary tree: each node is rb_free'd as the walk drops it.
+ *
+ * Pooled tree: nodes are NOT individually pool_free'd. Whole-tree destruction
+ * is exactly the case pool_destroy is for -- it releases every slab whether
+ * its slots were live, free-listed, or never carved -- so per-node pool_free
+ * would cost an O(n) pass of poisoning and free-list churn to hand slots back
+ * to a pool that is about to cease existing. What the walk is still required
+ * for is the payloads: keys and values live OUTSIDE the slabs and are not
+ * reclaimed by pool_destroy, so every key and owned value must be freed while
+ * its node is still readable.
+ *
+ * Hence the ordering, which is load-bearing in both modes:
+ *   1. capture `next` before anything is released,
+ *   2. free the key,
+ *   3. invoke value_free,
+ *   4. (ordinary only) rb_free the node,
+ * then after the walk, pool_destroy and finally the handle. Step 1 matters
+ * more under the pool than without it: a pooled node is still live slab memory
+ * after teardown passes over it, so a stale read would be invisible to ASan
+ * rather than a reported use-after-free. */
 void rb_destroy(rbtree_t *t) {
     if (t == NULL) return;
     struct rb_node *cur = t->root;
@@ -376,7 +466,7 @@ void rb_destroy(rbtree_t *t) {
             next = cur->right;
             rb_free(cur->key);
             if (t->value_free) t->value_free(cur->value);
-            rb_free(cur);
+            if (t->pool == NULL) rb_free(cur); /* pooled: reclaimed wholesale below */
         } else {
             struct rb_node *left = cur->left;
             cur->left = left->right;
@@ -385,6 +475,9 @@ void rb_destroy(rbtree_t *t) {
         }
         cur = next;
     }
+    /* Last, and only after the walk: every node it traversed physically lives
+     * inside a slab this releases. */
+    if (t->pool != NULL) pool_destroy(t->pool);
     rb_free(t);
 }
 
