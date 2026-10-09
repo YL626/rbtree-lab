@@ -1,12 +1,18 @@
 # PROMPTLOG
 
-Trimmed to the 7 most substantive annotated episodes from a longer working log kept across the
+Trimmed to the 8 most substantive annotated episodes from a longer working log kept across the
 `rb_delete` (M2) milestone, its coverage-audit follow-up, an adversarial review session, the
-session that closed the gap that review found, and the start of HW2's Mutation 1 (allocation-
-failure fault injection). Each entry is: what I asked, what came back, and my judgment call —
-accepted, revised, or rejected, and why. Corresponding commits: `71b55ac`, `f32e9ef`, `8fa9072`,
-`ddfdbf9`, `ff09cbb`, `7a6e2b7`. Episode 6's Phase A work (`tests/fault_alloc.{c,h}`, the Makefile
-seam-linkage wiring, and the fault-injection test harness) is not yet committed as of this entry.
+session that closed the gap that review found, HW2's Mutation 1 (allocation-failure fault
+injection), and Mutation 2 (the slab pool's design session and the pooled-tree integration that
+closed it). Each entry is: what I asked, what came back, and my judgment call — accepted,
+revised, or rejected, and why. Corresponding commits: `71b55ac`, `f32e9ef`, `8fa9072`,
+`ddfdbf9`, `ff09cbb`, `7a6e2b7`, `a250531`, `a8f4439`, `febfdc2`, `d1ab2d2`, `0ebee46`,
+`21a44be`, `3d1afa9`, `36f82d1`.
+
+Note on count: the spec asks for 4–6 episodes and this file now carries 8, every one of them
+tied to real commits and diffs. Before submission, decide whether to cut to 6 — the two
+weakest candidates are Episodes 3 and 5, both of which are follow-through on gaps already
+narrated by Episodes 4 and 6 — rather than leaving the overage to be read as padding.
 
 ---
 
@@ -373,6 +379,83 @@ the three specific bugs Figure 4's caption and the spec's own M2 review prompt n
 process-coverage note below: the `src/pool.h` rejection was a rejected *plan element*, caught
 before any file was written — it is still not a rejected or oversized *diff*, and I am not
 counting it as one.
+
+---
+
+---
+
+## 8. Pooled-tree integration — an approved plan revised on four points, a deliverable-sequencing pushback, and a green suite I refused to trust
+
+**Prompt (evening 6, deliberately split).** I opened with "PLAN / INSPECTION ONLY FIRST. Do not
+edit yet," listed the eight files/functions to inspect, and asked seven lettered questions (A–G):
+the minimum state `struct rbtree` must gain, whether allocation/release could be centralized,
+the exact ownership/failure path for each of four failure points, whether delete still allocates
+nothing, the required ordering inside `rb_destroy`, the smallest way to run the A1 + M1 battery
+against both constructors, and which fault-sweep ordinals shift under the pool — with "do not
+hardcode expected n values" attached to the last one. Same split-prompt shape as Episode 7, for
+the same reason: a plan argued before a diff exists is a plan, not a back-rationalization.
+
+**What came back, and the four revisions I made to it.** The plan was mostly right and I approved
+it with changes. (1) **Teardown.** Claude proposed that pooled `rb_destroy` call `pool_free` on
+every node so the walk would drive `live` to zero, and argued for it on the grounds that this
+"buys an assertable end state." I rejected that: whole-tree destruction is exactly the case
+`pool_destroy` exists for — it releases every slab whether its slots were live, free-listed or
+never carved — so the per-node pass is poisoning and free-list churn handed to a pool that is
+about to cease existing. Keys and values are the only reason the walk survives at all, since
+they live outside the slabs. Claude accepted this and, to its credit, went back and amended its
+own earlier justification in writing rather than letting the superseded argument stand.
+(2) **Parameterization.** Its plan said to `sed` every `rb_create` to the factory; I required
+this be deliberate, with allocator-specific tests kept mode-specific. That turned out to matter:
+3 of the 32 sites are tests whose entire subject is `rbtree.c`'s own ordinals, and running them
+pooled would have changed what they assert while still passing. (3) **The fault sweep.** Claude
+proposed replacing parts of it with a "discover-then-arm" technique — run the scenario disarmed,
+record the ordinal, re-arm at it. I refused: the existing unbounded `n = 1, 2, 3, …` loop is
+already mode-agnostic, and swapping it for a discovery step would have traded a structural
+guarantee for a measurement. It survived the mutation untouched except for one message reword.
+(4) **The stats hook.** I cut the proposed `rb_test_pool_stats` as premature.
+
+**A deliverable-sequencing pushback I made after the diff existed.** Claude finished slice 1,
+showed the diff, reported all three gates green, and asked whether to commit as one commit or
+two. I told it not to commit at all yet: the repository's own suite still never constructed a
+pooled tree, so the only evidence was a scratch driver, and evening 6 is not complete until the
+committed battery covers the pooled build. This is worth logging precisely because it is *not*
+a rejected diff — the code was fine and went in later unchanged. What I rejected was calling it
+done. Claude had actually anticipated the weakness itself (it wrote the scratch driver
+unprompted, explicitly because "slice 1 would otherwise ship unexercised," and listed "the
+graded suite still never constructs a pooled tree" as the first of four flagged gaps), but
+anticipating a gap in prose is not the same as not committing across it.
+
+**The part I would not have asked for: a green suite interrogated anyway.** With everything
+passing — 1897 assertions, both fuzz modes, asan and valgrind clean — Claude counted the labelled
+assertions per mode and found 637 heap vs 613 pooled, then stopped and said a 24-line gap is
+indistinguishable from a test silently degrading into a no-op in the second mode. It diffed the
+two description sets (identical with the sweep excluded: all 565 non-sweep assertions in both
+modes, same order) and decomposed the remainder by hand: the sweep runs 8 iterations heap vs 7
+pooled, because heap allocates 1 + 3×2 = 7 while pooled allocates 2 + 2 + 1 + 1 = 6; and the
+last five lines are `make_int`'s fixture check firing from *inside* the sweep, hand-derived as
+16 calls heap vs 11 pooled. Its first attribution attempt was wrong in a quiet way — it had
+classified lines by whether they contained `[sweep]`, which misfiled the sweep's own `make_int`
+calls as non-sweep — and it caught and corrected that itself rather than letting the first
+number stand. I have asked this project's agent to re-derive numbers rather than recompute them
+all through M2; this is the first time it applied that standard to its own passing test run
+without being told.
+
+**One correction it volunteered against itself.** When reporting slice 1 it noted that its
+earlier plan had promised an `assert(live == 0)` before `pool_destroy`, that my revision removed
+it, and that the honest consequence is the tree-driven pool invariant now going unchecked — then
+said it would rather name that cost than let the plan's old justification stand unamended. That
+is the behavior I want from the log: the superseded argument gets retracted in writing, not
+quietly dropped.
+
+**Judgment: plan accepted with four revisions; one "done" claim rejected; two self-corrections
+accepted.** The split prompt earned its keep for the third time. What I would flag for the
+walkthrough is that the single most useful output of the evening was not code — it was the
+assertion-count audit, which is the only thing standing between "I ran the suite twice" and
+"the suite actually ran twice." It is now pinned in CLAUDE.md with an instruction that a future
+change to those two counts is to be investigated, not re-baselined. For the process-coverage
+note below: tonight's revisions were again all pre-diff, and the sequencing pushback was about
+whether work was *finished*, not about a diff's content — so this still is not a rejected or
+oversized diff, and I am not counting it as one.
 
 ---
 

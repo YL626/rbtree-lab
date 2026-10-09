@@ -8,7 +8,8 @@ This is a CS370 lab implementing a red-black tree in C, now on its second assign
 `CS370-HW2.pdf`, a continuation of HW1). `include/rbtree.h` is the frozen contract — it was
 re-frozen for HW2 and now also declares `rb_create_pooled` (Mutation 2: node storage drawn
 from an internal slab pool) and `rb_snapshot` (Mutation 4: O(1) copy-on-write snapshot, "The
-Reach" — no longer just ungraded prep, see below). Neither is implemented yet. `NOTES.md`
+Reach" — no longer just ungraded prep, see below). `rb_create_pooled` is now implemented
+(commit `3d1afa9`); `rb_snapshot` is not. `NOTES.md`
 contains the assignment spec, the design decisions already made (including a devlog of the
 NIL/parent-pointer/teardown reasoning and an HW2 section with spec notes/tips), and
 constraints that must not be violated — read it before writing any code here.
@@ -22,12 +23,38 @@ uses the non-recursive "Reach" technique (rotate into a right spine while freein
 **`rb_delete` is now implemented**, including `delete_fixup` (the doubly-black fixup loop,
 all cases plus the mirrored right-child symmetry) — both live in `src/rbtree.c` as of the
 M2 commits (`f32e9ef`..`8c55919`). `tests/fault_alloc.c` is implemented as of HW2's M1
-commits (`a250531`, `a8f4439`). `src/pool.c` now holds the Mutation 2 slot-geometry helper
-only — the pool's allocation/carving/free-list machinery and `rb_create_pooled` are still
-out of scope until their respective slices.
+commits (`a250531`, `a8f4439`).
+
+**`src/pool.c` is now complete** across four committed slices: the slot geometry
+(`febfdc2`), the pool lifecycle with a lazy first slab (`d1ab2d2`), slab growth and carving
+behind `pool_alloc` (`0ebee46`), and the intrusive free list with `pool_free` plus 0xDD debug
+poisoning (`21a44be`). **Pooled-tree integration is also done** (`3d1afa9`, `36f82d1`):
+`struct rbtree` carries an `rb_pool_t *pool` whose NULL-ness *is* the mode discriminator, and
+every mode-dependent decision in `src/rbtree.c` lives in exactly three places — the
+`node_alloc`/`node_release` pair (the single point where node storage is obtained and
+returned, which is what keeps `rb_insert`/`rb_delete` free of allocator branches),
+`rb_create_pooled`, and `rb_destroy`'s teardown branch. Only *node* storage is pooled; key
+copies are variable-length and stay on the `rb_malloc`/`rb_free` seam.
+
+Pooled teardown deliberately does **not** `pool_free` each node: whole-tree destruction is
+what `pool_destroy` is for (it releases every slab whether its slots were live, free-listed
+or never carved), so the walk exists only to free the keys and owned values, which live
+*outside* the slabs. Ordering is load-bearing — capture `next`, free the key, call
+`value_free`, (ordinary mode only) `rb_free` the node; then `pool_destroy`, then the handle.
+Capturing `next` first matters more under the pool than without it, since a pooled node is
+still live slab memory after teardown passes over it, so a stale read would be invisible to
+ASan rather than a reported use-after-free. One consequence to keep in mind: because teardown
+never walks `live` down to zero, `live + free_objs == slabs * objs_per_slab` is never checked
+against a *tree-driven* pool — a node skipped by teardown is caught via its leaked key under
+valgrind, which is sound but indirect. There is deliberately no `rb_test_pool_stats` hook.
+
+Still unimplemented: `rb_snapshot` (Mutation 4) and Mutation 3's O(1)-auxiliary-space
+`rb_foreach` (currently recursive, which HW1 §9 permits).
 
 `tests/fuzz.c` runs insert/find/delete ops against a reference-model oracle (an array of
-key/value pairs), interleaving `rb_delete` per its later M2 commit. `tests/test_rbtree.c`
+key/value pairs), interleaving `rb_delete` per its later M2 commit. Its usage is now
+`fuzz <op_count> [seed|-] [heap|pooled]` — the mode selects the constructor, and `-` keeps the
+default `time(NULL)` seeding so a mode can be passed positionally without pinning the seed. `tests/test_rbtree.c`
 covers insert/find (including overwrite and missing-key cases), foreach ordering, validate
 (ascending/descending/scrambled/empty), the insertion-fixup rotation cases (LL/RR/LR/RL,
 red-uncle recolor), destroy (single node, chain, value_free-once), and the table-driven
@@ -49,13 +76,24 @@ trees up to 500 nodes, plus a targeted search for all-black-ancestor-chain leave
 found; per NOTES.md's own "Confusions" note this gap is deliberately left to the fuzzer's
 existing ≥10^5-op coverage rather than forced into a table row — the spec's table-driven
 requirement (below) does not name it, and its absence from the table is a scoped decision, not
-an oversight. See `PROMPTLOG.md` episode 8 for the full derivation-and-pushback record.
+an oversight. See `PROMPTLOG.md` episode 2 for the full derivation-and-pushback record.
 
-As of 2026-09-15: `make test`, `make asan`, and `make memcheck` (from a clean rebuild) all
-pass with zero findings, including the fuzzer at 10^5 ops (asan/test) and 2×10^4 ops
-(memcheck, per the Makefile's smaller valgrind op count). This was the HW1 baseline; HW2
-work (pool allocator, fault injection, snapshot/Reach) starts from here and must not regress
-it.
+As of 2026-10-08: `make test`, `make asan`, and `make memcheck` (from a clean rebuild) all
+pass with zero findings — 1897 unit assertions, the fuzzer at 10^5 ops in *both* node-storage
+modes under test/asan and 2×10^4 ops in both under valgrind (three valgrind invocations, each
+reporting "All heap blocks were freed" and 0 errors). HW1's baseline was the same three gates
+green at 2026-09-15; the pool allocator, fault injection and pooled integration have been
+added without regressing it. Mutation 3 (snapshot/Reach, non-recursive `rb_foreach`) starts
+from here and must not regress it either.
+
+Coverage of the two-mode suite is a checked fact, not an inference: the heap pass emits 637
+labelled assertions and the pooled pass 613, and diffing the two description sets with the
+sweep excluded is identical — all 565 non-sweep tree assertions run in both modes, in the same
+order. The 24-line delta is sweep arithmetic (heap allocates 1 + 3×2 = 7 and terminates at
+n = 8; pooled allocates 2 + 2 + 1 + 1 = 6 and terminates at n = 7), plus five `make_int`
+fixture checks firing from inside the sweep. If a future change makes those two counts move
+for any other reason, that is a test silently degrading into a no-op and must be investigated,
+not re-baselined.
 
 ## Code map
 
@@ -63,15 +101,33 @@ it.
 - `src/rbtree.c` — tree logic: allocation/ownership, rotations, insertion and deletion
   fixups, `rb_validate`, teardown. All heap allocation here goes through the `rb_malloc`/
   `rb_free` seam.
-- `src/pool.c` — HW2 slab pool implementation (backs `rb_create_pooled`). Currently the slot
-  geometry only: `rb_pool_geometry` (stride, first-slot offset, slots per slab, tail slack)
-  plus the in-band `struct rb_slab` header whose size it accounts for. Internal to the file by
-  design — no `src/pool.h`, since the spec's file map is fixed; `tests/test_rbtree.c` declares
-  the helper itself under `RBTREE_TEST_HOOKS`, as it already does for the `rb_test_*` hooks.
+- `src/pool.c` — HW2 slab pool implementation (backs `rb_create_pooled`); complete.
+  `rb_pool_geometry` (stride, first-slot offset, slots per slab, tail slack) and the in-band
+  `struct rb_slab` header whose size it accounts for; `struct rb_pool`; `pool_create` (lazy —
+  buys no slab, so it has one fallible step and no unwind path), `pool_alloc` (free list →
+  uncarved → grow, the grow being the only fallible step and positioned last so "leaves the
+  pool as it was" holds by position rather than by undo), `pool_free` (intrusive free list,
+  0xDD-poisoning the full stride first so the link is not overwritten by the poison),
+  `pool_stats` (maintained counters plus a bounded debug-only free-list cross-check, so the
+  headline invariant is not checked solely against the numbers the mutators just wrote), and
+  `pool_destroy` (saves `slab->next` before each `rb_free`, since the chain link is in-band).
+  Internal to the file by design — no `src/pool.h`, since the spec's file map is fixed.
+  `tests/test_rbtree.c` declares what it needs itself under `RBTREE_TEST_HOOKS` (with
+  `rb_pool_t` left incomplete), as it already does for the `rb_test_*` hooks; `src/rbtree.c`
+  declares the four entry points it calls the same way.
 - `tests/test_rbtree.c` — unit tests / HW1 regression suite (table-driven `rb_delete` cases,
-  insertion-fixup cases, validate, destroy, overwrite semantics).
+  insertion-fixup cases, validate, destroy, overwrite semantics), plus the pool-internal
+  tests. Structured as `run_tree_suite()` run twice via the `make_tree` factory — once with
+  `rb_create`, once with `rb_create_pooled` — so the semantic assertions are written once and
+  executed against both allocators. `check()` prefixes `mode_label` so a failure names its
+  mode. Three fault tests deliberately keep naming `rb_create`: `fault_alloc_arm(1/2/3)` pins
+  `src/rbtree.c`'s own ordinals (handle, node struct, key copy), which under the pool are
+  different allocations in different numbers, so a pooled run of them would not be the same
+  claim — their pooled counterparts are separate tests. Pool-internal tests are not tree tests
+  and stay outside the two-mode suite. When adding a tree test, use `make_tree`, not a
+  constructor by name.
 - `tests/fuzz.c` — randomized stress driver / reference-model (oracle) testing against a
-  plain array of key/value pairs.
+  plain array of key/value pairs. Takes `<op_count> [seed|-] [heap|pooled]`.
 - `tests/fault_alloc.c` / `tests/fault_alloc.h` — allocation-seam shim and fault-injection
   support for HW2 (make allocation fail on demand). Implemented: `rb_malloc`/`rb_free` plus
   `fault_alloc_arm`/`fault_alloc_disarm`/`fault_alloc_total`.
@@ -80,16 +136,21 @@ it.
 
 ```sh
 make          # builds build/test_rbtree and build/fuzz
-make test     # builds, then runs ./build/test_rbtree && ./build/fuzz 100000
+make test     # builds, then runs ./build/test_rbtree, then the fuzzer at 100000 ops
+              # in BOTH modes: `fuzz 100000 - heap` && `fuzz 100000 - pooled`
 make asan     # rebuilds with -fsanitize=address,undefined, then runs `test`
-make memcheck # builds, then runs both binaries under valgrind --leak-check=full
-              # (test_rbtree, and fuzz with 20000 ops), --error-exitcode=1
+make memcheck # builds, then runs three binaries under valgrind --leak-check=full
+              # (test_rbtree; fuzz 20000 heap; fuzz 20000 pooled), --error-exitcode=1
 make clean
 ```
 
 There is no test filter — `test_rbtree` is a single binary of unit tests (including the
-table-driven `rb_delete` cases) run via `./build/test_rbtree`; the fuzzer takes an operation
-count as argv[1] (`./build/fuzz 100000`). Toolchain is `gcc -std=c23 -Wall -Wextra -Werror`.
+table-driven `rb_delete` cases, run once per node-storage mode) invoked as
+`./build/test_rbtree`; the fuzzer takes `<op_count> [seed|-] [heap|pooled]`
+(`./build/fuzz 100000 - pooled`, or `./build/fuzz 100000 42 heap` to pin a seed for a
+reproducible run). Both fuzz modes must pass. Do not reduce an op count to save runtime —
+NOTES.md's own note on this permits moving a *large* case to its own target, not shrinking
+one quietly. Toolchain is `gcc -std=c23 -Wall -Wextra -Werror`.
 Every change must be clean under both `make asan` and `make memcheck` before it's considered
 done — the spec requires zero findings across the whole suite, including the empty-tree case.
 
