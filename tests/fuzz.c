@@ -1,4 +1,5 @@
 #include "rbtree.h"
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,15 +76,32 @@ static void make_key(char *buf, size_t buflen, unsigned key_space) {
     snprintf(buf, buflen, "key%06u", (unsigned)(rand() % key_space));
 }
 
+/* usage: fuzz <op_count> [seed|-] [heap|pooled]
+ *
+ * The mode selects which constructor the tree under test comes from, so the
+ * identical op stream and the identical oracle run against both node-storage
+ * allocators -- Mutation 2 is not covered until the pooled tree has taken the
+ * same beating as the heap one. "-" for the seed keeps the default
+ * time(NULL) seeding while still letting a mode be passed positionally, so
+ * repeated runs keep exploring new op streams in both modes. */
 int main(int argc, char **argv) {
     long op_count = argc > 1 ? atol(argv[1]) : 100000;
-    unsigned seed = argc > 2 ? (unsigned)atol(argv[2]) : (unsigned)time(NULL);
+    unsigned seed = (argc > 2 && strcmp(argv[2], "-") != 0)
+                      ? (unsigned)atol(argv[2]) : (unsigned)time(NULL);
+    const char *mode = argc > 3 ? argv[3] : "heap";
     unsigned key_space = 5000;
-    srand(seed);
-    printf("fuzz: seed=%u op_count=%ld\n", seed, op_count);
 
-    rbtree_t *t = rb_create(NULL);
-    if (t == NULL) { fprintf(stderr, "fuzz: rb_create failed\n"); return 1; }
+    bool pooled = strcmp(mode, "pooled") == 0;
+    if (!pooled && strcmp(mode, "heap") != 0) {
+        fprintf(stderr, "fuzz: unknown mode '%s' (expected heap or pooled)\n", mode);
+        return 1;
+    }
+
+    srand(seed);
+    printf("fuzz: mode=%s seed=%u op_count=%ld\n", mode, seed, op_count);
+
+    rbtree_t *t = pooled ? rb_create_pooled(NULL) : rb_create(NULL);
+    if (t == NULL) { fprintf(stderr, "fuzz: tree creation (%s) failed\n", mode); return 1; }
 
     struct model m;
     model_init(&m);
@@ -173,6 +191,6 @@ int main(int argc, char **argv) {
     rb_destroy(t);
     model_destroy(&m);
 
-    printf("fuzz: %ld insert/find/delete ops OK\n", op_count);
+    printf("fuzz: %s: %ld insert/find/delete ops OK\n", mode, op_count);
     return 0;
 }

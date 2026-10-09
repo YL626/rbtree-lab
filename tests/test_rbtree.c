@@ -44,14 +44,37 @@ extern void       pool_destroy(rb_pool_t *p);
 
 static int failures = 0;
 
+/* Mutation 2: the semantic tree tests are run twice, once per node-storage
+ * mode, by pointing this factory at rb_create and then rb_create_pooled.
+ * Every such test calls make_tree() instead of naming a constructor, so the
+ * assertions are written once and executed against both allocators -- nothing
+ * is duplicated, and nothing is weakened to accommodate the second pass.
+ *
+ * The three fault tests whose SUBJECT is src/rbtree.c's own allocation
+ * ordinals (fault_alloc_arm(1/2/3) for the handle, the node struct and the
+ * key copy) still name rb_create directly: under the pool those ordinals are
+ * different numbers describing different allocations, so running them pooled
+ * would not be the same claim. Their pooled counterparts are separate tests
+ * further down. Pool-internal tests (geometry, pool_create/alloc/free/destroy)
+ * are not tree tests and stay outside the two-mode suite entirely. */
+typedef rbtree_t *(*tree_factory_fn)(rb_value_free_fn);
+static tree_factory_fn make_tree = rb_create;
+
+/* Non-NULL while a mode-specific pass is running, so a failure names the mode
+ * it failed in rather than leaving two identical descriptions ambiguous.
+ * NULL restores the original single-pass output for mode-agnostic tests. */
+static const char *mode_label = NULL;
+
 static void check(int cond, const char *desc) {
-    if (cond) { printf("PASS: %s\n", desc); }
-    else      { printf("FAIL: %s\n", desc); failures++; }
+    const char *result = cond ? "PASS" : "FAIL";
+    if (mode_label != NULL) printf("%s: <%s> %s\n", result, mode_label, desc);
+    else                    printf("%s: %s\n", result, desc);
+    if (!cond) failures++;
 }
 
 static void test_create_destroy_empty(void) {
-    rbtree_t *t = rb_create(NULL);
-    check(t != NULL, "rb_create returns non-NULL");
+    rbtree_t *t = make_tree(NULL);
+    check(t != NULL, "tree factory returns non-NULL");
     check(rb_size(t) == 0, "fresh tree has size 0");
     check(rb_find(t, "anything") == NULL, "rb_find on empty tree returns NULL");
     rb_destroy(t);
@@ -63,7 +86,7 @@ static void test_destroy_null_is_safe(void) {
 }
 
 static void test_insert_and_find_single(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int value = 42;
     check(rb_insert(t, "apple", &value) == 0, "insert single key succeeds");
     check(rb_find(t, "apple") == &value, "find returns the inserted value");
@@ -72,7 +95,7 @@ static void test_insert_and_find_single(void) {
 }
 
 static void test_insert_and_find_multiple(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int a = 1, b = 2, c = 3;
     check(rb_insert(t, "banana", &a) == 0, "insert banana");
     check(rb_insert(t, "apple", &b) == 0, "insert apple");
@@ -85,7 +108,7 @@ static void test_insert_and_find_multiple(void) {
 }
 
 static void test_find_missing_key_returns_null(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int value = 7;
     check(rb_insert(t, "apple", &value) == 0, "insert apple");
     check(rb_find(t, "banana") == NULL, "find a never-inserted key returns NULL");
@@ -108,7 +131,7 @@ static int *make_int(int v) {
 
 static void test_overwrite_frees_old_value(void) {
     free_count = 0;
-    rbtree_t *t = rb_create(counting_free);
+    rbtree_t *t = make_tree(counting_free);
     int *first  = make_int(1);
     int *second = make_int(2);
     check(rb_insert(t, "apple", first) == 0, "insert apple with first value");
@@ -121,7 +144,7 @@ static void test_overwrite_frees_old_value(void) {
 }
 
 static void test_overwrite_with_null_value_free_does_not_crash(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int a = 1, b = 2;
     check(rb_insert(t, "apple", &a) == 0, "insert apple");
     check(rb_insert(t, "apple", &b) == 0, "overwrite apple with value_free NULL");
@@ -144,7 +167,7 @@ static void collect_key(const char *key, void *value, void *ctx_ptr) {
 }
 
 static void test_foreach_visits_in_order(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     const char *keys[5] = {"cherry", "apple", "elderberry", "banana", "date"};
     int values[5] = {0};
     for (int i = 0; i < 5; i++) {
@@ -162,7 +185,7 @@ static void test_foreach_visits_in_order(void) {
 }
 
 static void test_validate_on_ascending_insertion_order(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     const char *keys[5] = {"a", "b", "c", "d", "e"};
     int values[5] = {0};
     for (int i = 0; i < 5; i++) check(rb_insert(t, keys[i], &values[i]) == 0, "insert ascending");
@@ -171,7 +194,7 @@ static void test_validate_on_ascending_insertion_order(void) {
 }
 
 static void test_validate_on_descending_insertion_order(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     const char *keys[5] = {"e", "d", "c", "b", "a"};
     int values[5] = {0};
     for (int i = 0; i < 5; i++) check(rb_insert(t, keys[i], &values[i]) == 0, "insert descending");
@@ -180,7 +203,7 @@ static void test_validate_on_descending_insertion_order(void) {
 }
 
 static void test_validate_on_scrambled_insertion_order(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     const char *keys[5] = {"cherry", "apple", "elderberry", "banana", "date"};
     int values[5] = {0};
     for (int i = 0; i < 5; i++) check(rb_insert(t, keys[i], &values[i]) == 0, "insert scrambled");
@@ -189,14 +212,14 @@ static void test_validate_on_scrambled_insertion_order(void) {
 }
 
 static void test_validate_on_empty_tree(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     check(rb_validate(t) == 0, "validate passes on empty tree");
     rb_destroy(t);
 }
 
 #ifdef RBTREE_TEST_HOOKS
 static void test_validate_detects_red_root(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int a = 1, b = 2, c = 3;
     check(rb_insert(t, "b", &a) == 0, "insert b for red-root corruption fixture");
     check(rb_insert(t, "a", &b) == 0, "insert a for red-root corruption fixture");
@@ -213,7 +236,7 @@ static void test_validate_detects_red_root(void) {
  * BLACK children 'c'/'f' (invariant 2's fixture) and node 'a' BLACK with
  * BLACK parent 'b' and NIL children (invariant 3's fixture). */
 static rbtree_t *build_seven_key_fixture(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     static int dummy;
     const char *keys[] = {"b", "a", "c", "e", "d", "f", "g"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
@@ -249,7 +272,7 @@ static void test_validate_detects_order_violation(void) {
 }
 
 static void test_validate_detects_size_mismatch(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int a = 1, b = 2, c = 3;
     check(rb_insert(t, "b", &a) == 0, "insert b for size-mismatch fixture");
     check(rb_insert(t, "a", &b) == 0, "insert a for size-mismatch fixture");
@@ -262,7 +285,7 @@ static void test_validate_detects_size_mismatch(void) {
 #endif
 
 static void test_insert_single_root_is_black(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int value = 1;
     check(rb_insert(t, "only", &value) == 0, "insert single key for root-black test");
     check(rb_validate(t) == 0, "validate passes on single-node tree (root is black)");
@@ -275,7 +298,7 @@ static void test_insert_ascending_triggers_rr_rotation(void) {
      * A left rotation at a must promote b to root. If the rotation forgets to
      * update t->root, rb_find would search from the stale (demoted) root and
      * silently miss keys — the stale-root regression. */
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int va = 1, vb = 2, vc = 3;
     check(rb_insert(t, "a", &va) == 0, "insert a");
     check(rb_insert(t, "b", &vb) == 0, "insert b");
@@ -296,7 +319,7 @@ static void test_insert_ascending_triggers_rr_rotation(void) {
 static void test_insert_descending_triggers_ll_rotation(void) {
     /* Mirror of the RR case: c, b, a inserted descending forces the LL
      * straight-line case at the root, needing a right rotation at c. */
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int va = 1, vb = 2, vc = 3;
     check(rb_insert(t, "c", &vc) == 0, "insert c");
     check(rb_insert(t, "b", &vb) == 0, "insert b");
@@ -319,7 +342,7 @@ static void test_insert_triggers_red_uncle_recolor(void) {
      * violation). Inserting b (< d) creates a red-red violation (b, d) whose
      * uncle t is red -> Case 1: recolor d,t black, m red, then re-blacken m
      * since it's root. No rotation needed for this case. */
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int vm = 1, vd = 2, vtt = 3, vb = 4;
     check(rb_insert(t, "m", &vm) == 0, "insert m");
     check(rb_insert(t, "d", &vd) == 0, "insert d");
@@ -338,7 +361,7 @@ static void test_insert_triggers_lr_triangle_double_rotation(void) {
     /* c, a, b: a is c's red left child; b (between a and c) becomes a's red
      * right child -- a "triangle" on the left side, uncle (c's right, NIL)
      * black. Needs rotate_left(a) to straighten, then rotate_right(c). */
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int vc = 1, va = 2, vb = 3;
     check(rb_insert(t, "c", &vc) == 0, "insert c");
     check(rb_insert(t, "a", &va) == 0, "insert a");
@@ -359,7 +382,7 @@ static void test_insert_triggers_lr_triangle_double_rotation(void) {
 static void test_insert_triggers_rl_triangle_double_rotation(void) {
     /* Mirror of LR: a, c, b -- triangle on the right side, needs
      * rotate_right(c) to straighten, then rotate_left(a). */
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int va = 1, vc = 2, vb = 3;
     check(rb_insert(t, "a", &va) == 0, "insert a");
     check(rb_insert(t, "c", &vc) == 0, "insert c");
@@ -378,7 +401,7 @@ static void test_insert_triggers_rl_triangle_double_rotation(void) {
 }
 
 static void test_destroy_single_node(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int value = 1;
     check(rb_insert(t, "only", &value) == 0, "insert single node for destroy test");
     rb_destroy(t); /* clean under asan/memcheck is the test */
@@ -389,7 +412,7 @@ static void test_destroy_left_heavy_chain(void) {
      * (e -> d -> c -> b -> a). Exercises the Reach's rotation branch on every
      * iteration but the last, on purpose — not incidentally like the existing
      * descending-order validate test. */
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     const char *keys[5] = {"e", "d", "c", "b", "a"};
     int values[5] = {0};
     for (int i = 0; i < 5; i++) {
@@ -400,7 +423,7 @@ static void test_destroy_left_heavy_chain(void) {
 
 static void test_destroy_calls_value_free_once_per_node(void) {
     free_count = 0;
-    rbtree_t *t = rb_create(counting_free);
+    rbtree_t *t = make_tree(counting_free);
     const char *keys[5] = {"cherry", "apple", "elderberry", "banana", "date"};
     for (int i = 0; i < 5; i++) {
         check(rb_insert(t, keys[i], make_int(i)) == 0, "insert heap value for destroy-count test");
@@ -590,7 +613,7 @@ static const struct delete_case delete_cases[] = {
 };
 
 static void run_delete_case(const struct delete_case *c) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int values[TEST_MAX_KEYS] = {0};
     char msg[256];
 
@@ -626,7 +649,7 @@ static void test_delete_table_driven(void) {
 }
 
 static void test_delete_missing_key_returns_error(void) {
-    rbtree_t *t = rb_create(NULL);
+    rbtree_t *t = make_tree(NULL);
     int value = 1;
     check(rb_insert(t, "apple", &value) == 0, "insert apple for missing-key delete test");
     check(rb_delete(t, "banana") == -1, "rb_delete on absent key returns -1");
@@ -637,7 +660,7 @@ static void test_delete_missing_key_returns_error(void) {
 
 static void test_delete_frees_value(void) {
     free_count = 0;
-    rbtree_t *t = rb_create(counting_free);
+    rbtree_t *t = make_tree(counting_free);
     check(rb_insert(t, "apple", make_int(1)) == 0, "insert apple with heap value");
     check(rb_delete(t, "apple") == 0, "delete apple");
     check(free_count == 1, "value_free called exactly once on delete");
@@ -740,7 +763,7 @@ static void test_fault_insert_key_alloc_failure(void) {
 
 static void test_fault_overwrite_allocates_nothing(void) {
     free_count = 0;
-    rbtree_t *t = rb_create(counting_free);
+    rbtree_t *t = make_tree(counting_free);
     check(rb_insert(t, "apple", make_int(1)) == 0, "[overwrite] seed insert succeeds");
 
     fault_alloc_arm(1);
@@ -755,7 +778,7 @@ static void test_fault_overwrite_allocates_nothing(void) {
 
 static void test_fault_delete_allocates_nothing(void) {
     free_count = 0;
-    rbtree_t *t = rb_create(counting_free);
+    rbtree_t *t = make_tree(counting_free);
     check(rb_insert(t, "apple", make_int(1)) == 0, "[delete] seed insert succeeds");
 
     fault_alloc_arm(1);
@@ -805,9 +828,15 @@ static void test_fault_sweep(void) {
         free_count = 0;
         fault_alloc_arm(n);
 
-        rbtree_t *t = rb_create(counting_free);
+        rbtree_t *t = make_tree(counting_free);
         if (t == NULL) {
-            check(fault_alloc_total() == n, "[sweep] rb_create's own allocation was the n-th call");
+            /* Heap: creation is one allocation, so this can only be n == 1.
+             * Pooled: creation is the handle then the pool, so n == 1 and
+             * n == 2 both land here, via two different unwind paths. The
+             * assertion is the same either way -- the injector fires at call
+             * n and creation reports failure -- which is why the sweep needs
+             * no mode-specific arithmetic. */
+            check(fault_alloc_total() == n, "[sweep] tree creation failed at the armed call n");
             fault_alloc_disarm();
             continue;
         }
@@ -898,6 +927,116 @@ static void test_fault_sweep(void) {
 
     check(terminated, "[sweep] sweep terminated via the legitimate completion condition "
                        "(fault_alloc_total() < n after a completed scenario run)");
+}
+
+/* ---- Mutation 2: pooled-storage allocation failures ----
+ *
+ * The heap tests above pin src/rbtree.c's ordinals: 1 = the tree handle,
+ * 2 = the node struct, 3 = the key copy. Under the pool those are different
+ * allocations in different numbers, so these are separate tests rather than
+ * a second run of the same ones -- the claims genuinely differ:
+ *
+ *   - creation is TWO allocations (the handle, then the pool struct), so it
+ *     has two distinct unwind paths where the heap tree has one;
+ *   - an insert's node storage costs an rb_malloc only when the pool must buy
+ *     a slab, so the "node allocation failed" case is reachable on the first
+ *     insert into a fresh pool and not on the ones after it;
+ *   - the key copy is still exactly one rb_malloc per new key, but failing it
+ *     now has a pool slot to hand back, which the heap path does not.
+ *
+ * fault_alloc_arm resets the since-arm counter, so arming AFTER a successful
+ * rb_create_pooled makes the ordinals below insert-relative: within one insert
+ * into a fresh pool, call 1 is the slab and call 2 is the key copy. That is
+ * the pooled analogue of the heap tests' node-then-key pinning, not a
+ * discovered magic number. */
+
+static void test_fault_pooled_create_failures(void) {
+    /* Call 1: the tree handle. Nothing is held yet, so there is nothing to
+     * unwind -- the path that must NOT try to release a pool it never made. */
+    fault_alloc_arm(1);
+    rbtree_t *t = rb_create_pooled(NULL);
+    check(t == NULL, "[pooled create] NULL when the tree-handle allocation fails");
+    check(fault_alloc_total() == 1, "[pooled create] handle failure is call 1");
+    fault_alloc_disarm();
+    if (t != NULL) rb_destroy(t); /* unexpected success -- do not leak it */
+
+    /* Call 2: pool_create's single allocation. The handle is already live and
+     * must be released. A leak here is caught by asan/memcheck, which is the
+     * only way this path is observable from outside. */
+    fault_alloc_arm(2);
+    t = rb_create_pooled(NULL);
+    check(t == NULL, "[pooled create] NULL when pool_create's allocation fails");
+    check(fault_alloc_total() == 2,
+          "[pooled create] pool failure is call 2 (creation is two allocations, not one)");
+    fault_alloc_disarm();
+    if (t != NULL) rb_destroy(t);
+}
+
+/* The pooled counterpart of test_fault_insert_node_alloc_failure: node storage
+ * fails because the pool could not buy its first slab. pool_grow mutates
+ * nothing on failure and pool_alloc touches no counter before it, so the pool
+ * is bit-identical afterwards and the tree never saw a node at all. */
+static void test_fault_pooled_insert_slab_alloc_failure(void) {
+    free_count = 0;
+    rbtree_t *t = rb_create_pooled(counting_free);
+    check(t != NULL, "[pooled slab-alloc] rb_create_pooled succeeds before arming");
+    if (t == NULL) return;
+
+    size_t size_before = rb_size(t);
+    void  *find_before = rb_find(t, "a");
+    int free_count_before = free_count;
+    int *value = make_int(99);
+
+    fault_alloc_arm(1); /* insert-relative call 1 = the slab purchase */
+    int rc = rb_insert(t, "a", value);
+    check(rc == -1, "[pooled slab-alloc] rb_insert returns -1 when the slab purchase fails");
+    check(fault_alloc_total() == 1,
+          "[pooled slab-alloc] the slab purchase was the insert's first allocation");
+    assert_unchanged(t, NULL, NULL, 0, "a", find_before, size_before,
+                     free_count_before, "pooled slab-alloc");
+    fault_alloc_disarm();
+
+    if (rc != 0) free(value); /* tree never took ownership */
+    rb_destroy(t);
+}
+
+/* The pooled counterpart of test_fault_insert_key_alloc_failure, plus the one
+ * thing the heap path cannot assert: the node slot pool_alloc already handed
+ * out must go BACK to the pool, not be stranded. The proof is the follow-up
+ * insert costing exactly one rb_malloc -- the key copy, with no second slab --
+ * which can only hold if the rolled-back slot was reused. */
+static void test_fault_pooled_insert_key_alloc_failure_reuses_slot(void) {
+    free_count = 0;
+    rbtree_t *t = rb_create_pooled(counting_free);
+    check(t != NULL, "[pooled key-alloc] rb_create_pooled succeeds before arming");
+    if (t == NULL) return;
+
+    size_t size_before = rb_size(t);
+    void  *find_before = rb_find(t, "a");
+    int free_count_before = free_count;
+    int *value = make_int(99);
+
+    fault_alloc_arm(2); /* call 1 = slab purchase (succeeds), call 2 = key copy */
+    int rc = rb_insert(t, "a", value);
+    check(rc == -1, "[pooled key-alloc] rb_insert returns -1 when the key copy fails");
+    check(fault_alloc_total() == 2,
+          "[pooled key-alloc] the failure landed on the key copy, after pool_alloc succeeded");
+    assert_unchanged(t, NULL, NULL, 0, "a", find_before, size_before,
+                     free_count_before, "pooled key-alloc");
+    fault_alloc_disarm();
+    if (rc != 0) free(value); /* tree never took ownership */
+
+    /* arm(0) never injects; it resets the counter so the next line measures. */
+    fault_alloc_arm(0);
+    check(rb_insert(t, "a", make_int(1)) == 0, "[pooled key-alloc] insert after rollback succeeds");
+    check(fault_alloc_total() == 1,
+          "[pooled key-alloc] it cost one rb_malloc (the key only) -- the rolled-back "
+          "slot was reused, not stranded");
+    check(rb_size(t) == 1 && rb_validate(t) == 0,
+          "[pooled key-alloc] tree is valid and sized 1 after the reused-slot insert");
+    fault_alloc_disarm();
+
+    rb_destroy(t);
 }
 
 #ifdef RBTREE_TEST_HOOKS
@@ -1904,7 +2043,15 @@ static void test_pool_destroy_with_populated_free_list(void) {
 }
 #endif
 
-int main(void) {
+/* The semantic tree suite: every test whose claim is about tree BEHAVIOUR
+ * rather than about a particular allocator's call sequence. Run once per
+ * node-storage mode via make_tree. The two fault tests at the end belong here
+ * precisely because their claims are allocator-independent -- "overwrite
+ * allocates nothing" and "delete allocates nothing" are true of rb_malloc and
+ * of pool_free alike -- and because the sweep's structure (arm n = 1, 2, 3,
+ * ... and assert the failure lands at call n) needs no mode-specific
+ * arithmetic to stay valid. */
+static void run_tree_suite(void) {
     test_create_destroy_empty();
     test_destroy_null_is_safe();
     test_insert_and_find_single();
@@ -1936,13 +2083,38 @@ int main(void) {
     test_delete_table_driven();
     test_delete_missing_key_returns_error();
     test_delete_frees_value();
-    test_fault_rb_create_failure();
-    test_fault_insert_node_alloc_failure();
-    test_fault_insert_key_alloc_failure();
     test_fault_overwrite_allocates_nothing();
     test_fault_delete_allocates_nothing();
     test_fault_sweep();
+}
+
+int main(void) {
+    /* Pass 1: ordinary rb_malloc node storage (the HW1 + M1 baseline). */
+    make_tree  = rb_create;
+    mode_label = "heap";
+    run_tree_suite();
+
+    /* Pass 2: the identical assertions against pooled node storage. */
+    make_tree  = rb_create_pooled;
+    mode_label = "pooled";
+    run_tree_suite();
+
+    make_tree  = rb_create;
+    mode_label = NULL;
+
+    /* Allocator-specific ordinal pins, each run once in the mode it describes.
+     * These are deliberately NOT in run_tree_suite: arm(1/2/3) names the tree
+     * handle, the node struct and the key copy under rb_malloc, and a
+     * different set of allocations under the pool. */
+    test_fault_rb_create_failure();
+    test_fault_insert_node_alloc_failure();
+    test_fault_insert_key_alloc_failure();
+    test_fault_pooled_create_failures();
+    test_fault_pooled_insert_slab_alloc_failure();
+    test_fault_pooled_insert_key_alloc_failure_reuses_slot();
+
 #ifdef RBTREE_TEST_HOOKS
+    /* Pool internals. Not tree tests, so not part of the two-mode suite. */
     test_pool_geometry_table();
     test_pool_create_empty_stats();
     test_pool_create_rejects_unusable_obj_size();
