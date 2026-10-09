@@ -231,7 +231,7 @@ These are graded independently of the code and must not be neglected or bulk-gen
 - **Git history**: ≥ 8 meaningful commits tracking the milestones (M0–M3 in the schedule table,
   spec §5 — `M<n>: <what>` in a commit message names the milestone, not a "Mutation"). A single
   "final submission" commit is an automatic process-grade of zero.
-- **`PROMPTLOG.md`**: 4–6 annotated episodes (prompt, what came back, your judgment — accepted,
+- **`PROMPTLOG.md`**: 6–10 annotated episodes (prompt, what came back, your judgment — accepted,
   rejected, or pushed back on, and why). Must include at least: one plan you revised, one
   rejected/oversized diff, one tool-output debugging loop (e.g. a valgrind/asan trace fed back
   verbatim), and one adversarial-review finding you triaged. Raw transcript pastes score nothing —

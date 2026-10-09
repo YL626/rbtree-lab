@@ -9,11 +9,6 @@ revised, or rejected, and why. Corresponding commits: `71b55ac`, `f32e9ef`, `8fa
 `ddfdbf9`, `ff09cbb`, `7a6e2b7`, `a250531`, `a8f4439`, `febfdc2`, `d1ab2d2`, `0ebee46`,
 `21a44be`, `3d1afa9`, `36f82d1`.
 
-Note on count: the spec asks for 4–6 episodes and this file now carries 8, every one of them
-tied to real commits and diffs. Before submission, decide whether to cut to 6 — the two
-weakest candidates are Episodes 3 and 5, both of which are follow-through on gaps already
-narrated by Episodes 4 and 6 — rather than leaving the overage to be read as padding.
-
 ---
 
 ## 1. Plan revised twice under direct interrogation — imprecise control-flow claims caught before any test was written
