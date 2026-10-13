@@ -460,6 +460,7 @@ int rb_validate(const rbtree_t *t) {
 void rb_destroy(rbtree_t *t) {
     if (t == NULL) return;
     struct rb_node *cur = t->root;
+    /* Invariant: cur reaches N unfreed nodes; 2*N-S decreases (S = right-spine length). */
     while (cur != NULL) {
         struct rb_node *next;
         if (cur->left == NULL) {
@@ -582,5 +583,77 @@ int rb_test_swap_keys(rbtree_t *t, const char *key1, const char *key2) {
  * touching nothing else. Works on any tree, even empty. */
 void rb_test_bump_size(rbtree_t *t) {
     if (t != NULL) t->size += 1;
+}
+
+/* Mutation 3: rb_insert/rb_delete keep height O(log n), so no public-API
+ * sequence yields a deep tree, and a recursive teardown would pass every
+ * balanced test. This reshapes an existing tree into a single spine (all
+ * left children if `left`, else all right children) using the real
+ * rotations, so parent pointers, t->root, t->size, in-order sequence and
+ * ownership are all preserved; only colors become meaningless (rb_validate
+ * will report invariant 1-3 failures afterward). Iterative, O(1) space, no
+ * allocation. Verified separately by rb_test_spine_len, so the reshape never
+ * vouches for itself. */
+void rb_test_make_spine(rbtree_t *t, bool left) {
+    if (t == NULL) return;
+    struct rb_node *cur = t->root;
+    /* Invariant: every node above cur has no child on the off-spine side. */
+    while (cur != NULL) {
+        struct rb_node *off = left ? cur->right : cur->left;
+        if (off != NULL) {
+            if (left) rotate_left(t, cur);
+            else      rotate_right(t, cur);
+            cur = off; /* off now occupies cur's old position */
+        } else {
+            cur = left ? cur->left : cur->right;
+        }
+    }
+}
+
+/* Length of the path from the root following only left (or only right)
+ * links. Equals rb_size exactly when the tree is a single spine. */
+size_t rb_test_spine_len(const rbtree_t *t, bool left) {
+    size_t len = 0;
+    if (t == NULL) return 0;
+    for (const struct rb_node *n = t->root; n != NULL; n = left ? n->left : n->right) len++;
+    return len;
+}
+
+/* Structural check rb_validate does not make: every child's parent pointer
+ * names its actual parent, the root's is NULL, the in-order sequence is
+ * strictly increasing, and the node count equals t->size. Iterative in-order
+ * walk over parent pointers, O(1) space, so it is safe on a degenerate spine.
+ * An upward step only ever follows a parent link that was verified on the way
+ * down, so the walk never trusts a pointer it is checking. Returns true when
+ * all of it holds. */
+bool rb_test_links_ok(const rbtree_t *t) {
+    if (t == NULL) return false;
+    const struct rb_node *cur = t->root, *prev = NULL;
+    size_t count = 0;
+    if (cur == NULL) return t->size == 0;
+    if (cur->parent != NULL) return false;
+    while (cur->left != NULL) {
+        if (cur->left->parent != cur) return false;
+        cur = cur->left;
+    }
+    /* Invariant: cur is the in-order successor of prev, and every edge on
+     * the path root..cur has had its child->parent link verified. */
+    while (cur != NULL) {
+        if (prev != NULL && strcmp(prev->key, cur->key) >= 0) return false;
+        if (++count > t->size) return false; /* also bounds a corrupted cycle */
+        prev = cur;
+        if (cur->right != NULL) {
+            if (cur->right->parent != cur) return false;
+            cur = cur->right;
+            while (cur->left != NULL) {
+                if (cur->left->parent != cur) return false;
+                cur = cur->left;
+            }
+        } else {
+            while (cur->parent != NULL && cur == cur->parent->right) cur = cur->parent;
+            cur = cur->parent;
+        }
+    }
+    return count == t->size;
 }
 #endif

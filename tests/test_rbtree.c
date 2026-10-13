@@ -18,6 +18,11 @@ extern int  rb_test_force_red_red(rbtree_t *t);
 extern int  rb_test_break_black_height(rbtree_t *t);
 extern int  rb_test_swap_keys(rbtree_t *t, const char *key1, const char *key2);
 extern void rb_test_bump_size(rbtree_t *t);
+/* Mutation 3: reshape into a single left/right spine, measure a spine, and
+ * check parent links + in-order + size without recursion. */
+extern void   rb_test_make_spine(rbtree_t *t, bool left);
+extern size_t rb_test_spine_len(const rbtree_t *t, bool left);
+extern bool   rb_test_links_ok(const rbtree_t *t);
 
 /* Defined in src/pool.c (Mutation 2 slot geometry). Internal to the pool:
  * absent from the frozen rbtree.h and deliberately given no header of its
@@ -408,10 +413,12 @@ static void test_destroy_single_node(void) {
 }
 
 static void test_destroy_left_heavy_chain(void) {
-    /* Descending insertion order with no fixup builds a pure left-child chain
-     * (e -> d -> c -> b -> a). Exercises the Reach's rotation branch on every
-     * iteration but the last, on purpose — not incidentally like the existing
-     * descending-order validate test. */
+    /* Descending insertion order. With the insertion fixup in place this does
+     * NOT build a left-child chain: it rebalances to d(b(a,c),e), so the Reach
+     * rotates only n - s0 = 5 - 2 = 3 times (at d, at b, then at d again once
+     * c is its left child). The genuinely degenerate left/right spines are
+     * built by rb_test_make_spine in test_destroy_left_spine and
+     * test_destroy_right_spine below. */
     rbtree_t *t = make_tree(NULL);
     const char *keys[5] = {"e", "d", "c", "b", "a"};
     int values[5] = {0};
@@ -431,6 +438,133 @@ static void test_destroy_calls_value_free_once_per_node(void) {
     rb_destroy(t);
     check(free_count == 5, "value_free called exactly once per node on destroy");
 }
+
+/* ---- Mutation 3: teardown shape, ownership and no-allocation coverage ----
+ * Every case destroys with the injector armed at call 1, so any rb_malloc
+ * during teardown would both fail and be counted, then pins the exact number
+ * of value_free calls. Keys are formatted into 24-byte buffers: 16 trips
+ * -Werror=format-truncation for a full-range int. */
+static void destroy_and_check(rbtree_t *t, int expected_frees, const char *shape) {
+    char desc[128];
+    fault_alloc_arm(1);
+    rb_destroy(t);
+    long allocs = fault_alloc_total();
+    fault_alloc_disarm();
+    snprintf(desc, sizeof desc, "[destroy: %s] teardown makes no rb_malloc call", shape);
+    check(allocs == 0, desc);
+    snprintf(desc, sizeof desc, "[destroy: %s] value_free called exactly once per node (%d)",
+             shape, expected_frees);
+    check(free_count == expected_frees, desc);
+}
+
+/* Inserts keys k000..k(n-1) in a fixed scrambled order (stride 37, coprime
+ * with every n used here), each value an owned int. */
+static rbtree_t *build_scrambled(int n, const char *shape) {
+    char desc[128];
+    rbtree_t *t = make_tree(counting_free);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        char key[24];
+        snprintf(key, sizeof key, "k%03d", (i * 37) % n);
+        if (rb_insert(t, key, make_int(i)) != 0) ok = 0;
+    }
+    snprintf(desc, sizeof desc, "[destroy: %s] all %d inserts succeed", shape, n);
+    check(ok && rb_size(t) == (size_t)n, desc);
+    return t;
+}
+
+struct sorted_ctx {
+    const char *prev;
+    size_t      count;
+    int         sorted;
+};
+
+static void check_sorted(const char *key, void *value, void *ctx_ptr) {
+    (void)value;
+    struct sorted_ctx *ctx = ctx_ptr;
+    if (ctx->prev != NULL && strcmp(ctx->prev, key) >= 0) ctx->sorted = 0;
+    ctx->prev = key;
+    ctx->count++;
+}
+
+static void test_destroy_empty_with_destructor(void) {
+    free_count = 0;
+    destroy_and_check(make_tree(counting_free), 0, "empty");
+}
+
+static void test_destroy_single_with_destructor(void) {
+    free_count = 0;
+    rbtree_t *t = make_tree(counting_free);
+    check(rb_insert(t, "only", make_int(1)) == 0, "[destroy: single] insert succeeds");
+    destroy_and_check(t, 1, "single");
+}
+
+static void test_destroy_balanced(void) {
+    free_count = 0;
+    rbtree_t *t = build_scrambled(127, "balanced");
+    check(rb_validate(t) == 0, "[destroy: balanced] tree is a valid red-black tree");
+#ifdef RBTREE_TEST_HOOKS
+    check(rb_test_links_ok(t), "[destroy: balanced] parent links, order and size consistent");
+#endif
+    destroy_and_check(t, 127, "balanced");
+}
+
+/* Irregular shape: a fixed LCG drives inserts, overwrites and deletes over a
+ * 200-key space, so the tree destroyed is whatever deletion fixups left
+ * behind. Deletes and overwrites already called value_free, so teardown must
+ * add exactly rb_size more. */
+static void test_destroy_irregular(void) {
+    free_count = 0;
+    rbtree_t *t = make_tree(counting_free);
+    unsigned state = 12345u;
+    int ok = 1;
+    for (int i = 0; i < 600; i++) {
+        state = state * 1103515245u + 12345u;
+        char key[24];
+        snprintf(key, sizeof key, "k%03u", (state >> 16) % 200u);
+        if (((state >> 8) & 3u) == 0) {
+            (void)rb_delete(t, key); /* missing key is fine; -1 frees nothing */
+        } else {
+            int *v = make_int(i);
+            if (rb_insert(t, key, v) != 0) { free(v); ok = 0; }
+        }
+    }
+    check(ok, "[destroy: irregular] every insert/overwrite succeeds");
+    check(rb_validate(t) == 0, "[destroy: irregular] tree is a valid red-black tree");
+#ifdef RBTREE_TEST_HOOKS
+    check(rb_test_links_ok(t), "[destroy: irregular] parent links, order and size consistent");
+#endif
+    check(rb_size(t) > 0, "[destroy: irregular] fixture leaves a non-empty tree");
+    destroy_and_check(t, free_count + (int)rb_size(t), "irregular");
+}
+
+#ifdef RBTREE_TEST_HOOKS
+/* Degenerate spines. Left spine is the Reach's worst case (2n - 1 iterations:
+ * n - 1 rotations, n frees); right spine is its best (zero rotations). A
+ * recursive teardown would be O(n) deep on either. */
+static void test_destroy_spine(bool left, const char *shape) {
+    char desc[128];
+    const int n = 64;
+    free_count = 0;
+    rbtree_t *t = build_scrambled(n, shape);
+    rb_test_make_spine(t, left);
+    size_t len = rb_test_spine_len(t, left);
+    snprintf(desc, sizeof desc, "[destroy: %s] reshape puts all %d nodes on one spine", shape, n);
+    check(len == (size_t)n, desc);
+    snprintf(desc, sizeof desc, "[destroy: %s] reshape keeps parent links, order and size", shape);
+    check(rb_test_links_ok(t) && rb_size(t) == (size_t)n, desc);
+    struct sorted_ctx ctx = { .prev = NULL, .count = 0, .sorted = 1 };
+    rb_foreach(t, check_sorted, &ctx);
+    snprintf(desc, sizeof desc, "[destroy: %s] foreach visits all %d keys in order", shape, n);
+    check(ctx.count == (size_t)n && ctx.sorted, desc);
+    snprintf(desc, sizeof desc, "[destroy: %s] reshape freed no value", shape);
+    check(free_count == 0, desc);
+    destroy_and_check(t, n, shape);
+}
+
+static void test_destroy_left_spine(void)  { test_destroy_spine(true,  "left spine"); }
+static void test_destroy_right_spine(void) { test_destroy_spine(false, "right spine"); }
+#endif
 
 /* ---- rb_delete: table-driven cases ----
  * Each case builds a tree via a fixed insertion sequence (chosen so the
@@ -2080,6 +2214,14 @@ static void run_tree_suite(void) {
     test_destroy_single_node();
     test_destroy_left_heavy_chain();
     test_destroy_calls_value_free_once_per_node();
+    test_destroy_empty_with_destructor();
+    test_destroy_single_with_destructor();
+    test_destroy_balanced();
+    test_destroy_irregular();
+#ifdef RBTREE_TEST_HOOKS
+    test_destroy_left_spine();
+    test_destroy_right_spine();
+#endif
     test_delete_table_driven();
     test_delete_missing_key_returns_error();
     test_delete_frees_value();
