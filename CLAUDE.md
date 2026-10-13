@@ -8,7 +8,7 @@ This is a CS370 lab implementing a red-black tree in C, now on its second assign
 `CS370-HW2.pdf`, a continuation of HW1). `include/rbtree.h` is the frozen contract — it was
 re-frozen for HW2 and now also declares `rb_create_pooled` (Mutation 2: node storage drawn
 from an internal slab pool) and `rb_snapshot` (Mutation 4: O(1) copy-on-write snapshot, "The
-Reach" — no longer just ungraded prep, see below). `rb_create_pooled` is now implemented
+Reach" — optional and ungraded in HW2 too, see below). `rb_create_pooled` is now implemented
 (commit `3d1afa9`); `rb_snapshot` is not. `NOTES.md`
 contains the assignment spec, the design decisions already made (including a devlog of the
 NIL/parent-pointer/teardown reasoning and an HW2 section with spec notes/tips), and
@@ -49,7 +49,11 @@ against a *tree-driven* pool — a node skipped by teardown is caught via its le
 valgrind, which is sound but indirect. There is deliberately no `rb_test_pool_stats` hook.
 
 Still unimplemented: `rb_snapshot` (Mutation 4) and Mutation 3's O(1)-auxiliary-space
-`rb_foreach` (currently recursive, which HW1 §9 permits).
+`rb_foreach` (currently recursive — HW1 §9 permitted that, HW2 §8.3 does not; Evening 8).
+Mutation 3's *teardown* half is done and verified (`45f8171`, `8c24b06`): `rb_destroy`'s
+existing right-spine loop was reviewed and left unchanged apart from its invariant comment, and
+is now covered by shape / ownership / no-allocation unit tests plus a 64 KB-pthread-stack
+stress harness (`--stress N`).
 
 `tests/fuzz.c` runs insert/find/delete ops against a reference-model oracle (an array of
 key/value pairs), interleaving `rb_delete` per its later M2 commit. Its usage is now
@@ -57,7 +61,9 @@ key/value pairs), interleaving `rb_delete` per its later M2 commit. Its usage is
 default `time(NULL)` seeding so a mode can be passed positionally without pinning the seed. `tests/test_rbtree.c`
 covers insert/find (including overwrite and missing-key cases), foreach ordering, validate
 (ascending/descending/scrambled/empty), the insertion-fixup rotation cases (LL/RR/LR/RL,
-red-uncle recolor), destroy (single node, chain, value_free-once), and the table-driven
+red-uncle recolor), destroy (single node, chain, value_free-once; and, per mode,
+empty/single/balanced/irregular plus hook-built left and right spines, each asserting zero
+`rb_malloc` calls during teardown and an exact `value_free` count), and the table-driven
 `rb_delete` cases. This now spans 17 rows in `delete_cases[]`: the spec's required minimum
 (red leaf + mirror, black leaf with red sibling + mirror, two-children root/non-root,
 single-node root, black node with one red child + mirror — 9 rows) plus an M2 coverage-audit
@@ -78,19 +84,24 @@ existing ≥10^5-op coverage rather than forced into a table row — the spec's 
 requirement (below) does not name it, and its absence from the table is a scoped decision, not
 an oversight. See `PROMPTLOG.md` episode 2 for the full derivation-and-pushback record.
 
-As of 2026-10-08: `make test`, `make asan`, and `make memcheck` (from a clean rebuild) all
-pass with zero findings — 1897 unit assertions, the fuzzer at 10^5 ops in *both* node-storage
-modes under test/asan and 2×10^4 ops in both under valgrind (three valgrind invocations, each
-reporting "All heap blocks were freed" and 0 errors). HW1's baseline was the same three gates
-green at 2026-09-15; the pool allocator, fault injection and pooled integration have been
-added without regressing it. Mutation 3 (snapshot/Reach, non-recursive `rb_foreach`) starts
-from here and must not regress it either.
+As of 2026-10-12: `make test`, `make asan`, `make stress-asan` and `make memcheck` (each from a
+clean rebuild) all pass with zero findings — 3371 unit assertions in the default run (most of
+the growth since M2 is the `make_int` fixture check, which emits one PASS per owned value; the
+Mutation 3 tests themselves add 29 per mode), the `--stress 20000` harness (34 assertions)
+under test/asan, the fuzzer at 10^5 ops in *both* node-storage modes under test/asan and
+2×10^4 ops in both under valgrind, `--stress 1000000` under ASan/UBSan via `stress-asan`
+(34 assertions, ~6 s), and four valgrind invocations each reporting "All heap blocks were
+freed" and 0 errors (the fourth is `test_rbtree --stress 20000`: 120,484 allocs/frees). The
+million-node case runs under ASan only; valgrind runs the 2×10^4 case — that shrink is
+deliberate and must be stated in REFLECTION.md. HW1's baseline was the same gates green at
+2026-09-15 and M2's at 2026-10-08 (1897 assertions); nothing has regressed since.
 
-Coverage of the two-mode suite is a checked fact, not an inference: the heap pass emits 637
-labelled assertions and the pooled pass 613, and diffing the two description sets with the
-sweep excluded is identical — all 565 non-sweep tree assertions run in both modes, in the same
-order. The 24-line delta is sweep arithmetic (heap allocates 1 + 3×2 = 7 and terminates at
-n = 8; pooled allocates 2 + 2 + 1 + 1 = 6 and terminates at n = 7), plus five `make_int`
+Coverage of the two-mode suite is a checked fact, not an inference: the heap pass emits 1374
+labelled assertions and the pooled pass 1350 (637/613 before Mutation 3), and diffing the two
+description sets with the sweep excluded is identical — all 1302 non-sweep tree assertions run
+in both modes, in the same order (565 before Mutation 3; both modes grew by exactly 737). The
+24-line delta is sweep arithmetic (heap allocates 1 + 3×2 = 7 and terminates at n = 8;
+pooled allocates 2 + 2 + 1 + 1 = 6 and terminates at n = 7), plus five `make_int`
 fixture checks firing from inside the sweep. If a future change makes those two counts move
 for any other reason, that is a test silently degrading into a no-op and must be investigated,
 not re-baselined.
@@ -125,7 +136,11 @@ not re-baselined.
   different allocations in different numbers, so a pooled run of them would not be the same
   claim — their pooled counterparts are separate tests. Pool-internal tests are not tree tests
   and stay outside the two-mode suite. When adding a tree test, use `make_tree`, not a
-  constructor by name.
+  constructor by name. `--stress N` runs *only* the Mutation 3 harness (heap and pooled ×
+  balanced and left spine): the tree is built on the main thread, then `rb_foreach` (balanced
+  only, until Evening 8) and `rb_destroy` run on a 64 KB pthread stack. Test hooks it relies on
+  (`RBTREE_TEST_HOOKS` only, never in `rbtree.h`): `rb_test_make_spine`, `rb_test_spine_len`,
+  `rb_test_links_ok`.
 - `tests/fuzz.c` — randomized stress driver / reference-model (oracle) testing against a
   plain array of key/value pairs. Takes `<op_count> [seed|-] [heap|pooled]`.
 - `tests/fault_alloc.c` / `tests/fault_alloc.h` — allocation-seam shim and fault-injection
@@ -136,18 +151,24 @@ not re-baselined.
 
 ```sh
 make          # builds build/test_rbtree and build/fuzz
-make test     # builds, then runs ./build/test_rbtree, then the fuzzer at 100000 ops
-              # in BOTH modes: `fuzz 100000 - heap` && `fuzz 100000 - pooled`
-make asan     # rebuilds with -fsanitize=address,undefined, then runs `test`
-make memcheck # builds, then runs three binaries under valgrind --leak-check=full
-              # (test_rbtree; fuzz 20000 heap; fuzz 20000 pooled), --error-exitcode=1
+make test     # builds, then runs ./build/test_rbtree, then `test_rbtree --stress 20000`,
+              # then the fuzzer at 100000 ops in BOTH modes:
+              # `fuzz 100000 - heap` && `fuzz 100000 - pooled`
+make asan     # clean rebuild with $(SAN_FLAGS) (address,undefined), then runs `test`
+make stress-asan # opt-in: clean ASan/UBSan rebuild of test_rbtree, then
+              # `test_rbtree --stress 1000000` (10^6 nodes, 64 KB pthread stack)
+make memcheck # clean rebuild, then four runs under valgrind --leak-check=full
+              # (test_rbtree; fuzz 20000 heap; fuzz 20000 pooled;
+              # test_rbtree --stress 20000), --error-exitcode=1
 make clean
 ```
 
 There is no test filter — `test_rbtree` is a single binary of unit tests (including the
 table-driven `rb_delete` cases, run once per node-storage mode) invoked as
-`./build/test_rbtree`; the fuzzer takes `<op_count> [seed|-] [heap|pooled]`
-(`./build/fuzz 100000 - pooled`, or `./build/fuzz 100000 42 heap` to pin a seed for a
+`./build/test_rbtree` (or `./build/test_rbtree --stress N`, 1 <= N <= 10^8, for the
+Mutation 3 harness alone; bad arguments exit 2); the fuzzer takes
+`<op_count> [seed|-] [heap|pooled]` (`./build/fuzz 100000 - pooled`, or
+`./build/fuzz 100000 42 heap` to pin a seed for a
 reproducible run). Both fuzz modes must pass. Do not reduce an op count to save runtime —
 NOTES.md's own note on this permits moving a *large* case to its own target, not shrinking
 one quietly. Toolchain is `gcc -std=c23 -Wall -Wextra -Werror`.
@@ -198,8 +219,11 @@ done — the spec requires zero findings across the whole suite, including the e
 - **Deletion fixup**: implement all cases, including deleting a black node with exactly one
   child, and the mirrored (right-child-of-right-child) symmetry of every fixup case — the
   spec explicitly calls out the mirror image as "the half people forget."
-- **`rb_foreach` / `rb_destroy`**: recursion is permitted for this assignment (spec §9). See
-  "The Reach" below for the ungraded non-recursive teardown.
+- **`rb_foreach` / `rb_destroy`**: HW1 §9 permitted recursion here; HW2 Mutation 3 (§8.3, and
+  the frozen header's comments on both functions) does not: no recursion, no heap-allocated
+  stack/queue, O(1) auxiliary space. `rb_destroy` meets this (right-spine teardown);
+  `rb_foreach` is still recursive (Evening 8). The constraint is stated for these two
+  functions only, not as a ban on recursion everywhere (e.g. `rb_validate`, the test hooks).
 - **`rb_validate` invariants** (must detect and report *which* invariant broke):
   1. root is black
   2. no red node has a red child
@@ -213,24 +237,26 @@ done — the spec requires zero findings across the whole suite, including the e
   fine), calling `rb_validate` at least every 100 ops, and must be clean under both asan and
   memcheck.
 
-## The Reach — HW1 (ungraded) vs HW2 (`rb_snapshot`, in scope)
+## The Reach — HW1 (ungraded) vs HW2 (`rb_snapshot`, optional and ungraded)
 
 HW1 framed non-recursive, O(1)-auxiliary-space teardown as ungraded prep for "the next
 assignment" (spec §10, "The Reach") — that next assignment is this one. `rb_destroy`'s
 rotate-into-a-right-spine-while-freeing technique already exists in `src/rbtree.c` from HW1;
 HW2's frozen header now adds `rb_snapshot` (Mutation 4: O(1) copy-on-write snapshot, NULL on
-allocation failure), which is graded here and is not yet implemented. Treat any reuse of the
-Reach technique for `rb_snapshot` as a new, from-scratch design question, not a copy-paste of
-`rb_destroy` — check CS370-HW2.pdf's own section for `rb_snapshot` before attempting it, and
-CS370-HW1.pdf §10 for the original Reach writeup.
+allocation failure), which is not yet implemented. It is optional and ungraded: HW2 §4 calls it
+"an optional, ungraded reach", §8.4 says "This mutation carries no points", and if it is not
+attempted `rb_snapshot` is simply left undefined (safe as long as nothing calls it). Treat any
+reuse of the Reach technique for `rb_snapshot` as a new, from-scratch design question, not a
+copy-paste of `rb_destroy` — check CS370-HW2.pdf's own section for `rb_snapshot` before
+attempting it, and CS370-HW1.pdf §10 for the original Reach writeup.
 
 ## Process requirements / deliverables (spec §7, §15, §17)
 
 These are graded independently of the code and must not be neglected or bulk-generated at the end:
 
-- **Git history**: ≥ 8 meaningful commits tracking the milestones (M0–M3 in the schedule table,
-  spec §5 — `M<n>: <what>` in a commit message names the milestone, not a "Mutation"). A single
-  "final submission" commit is an automatic process-grade of zero.
+- **Git history**: ≥ 10 meaningful commits (HW2 §6, §13) tracking the milestones (M0–M3 in the
+  schedule table, spec §5 — `M<n>: <what>` in a commit message names the milestone, not a
+  "Mutation"). A single "final submission" commit is an automatic process-grade of zero.
 - **`PROMPTLOG.md`**: 6–10 annotated episodes (prompt, what came back, your judgment — accepted,
   rejected, or pushed back on, and why). Must include at least: one plan you revised, one
   rejected/oversized diff, one tool-output debugging loop (e.g. a valgrind/asan trace fed back
