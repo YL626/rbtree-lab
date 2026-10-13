@@ -1,5 +1,6 @@
 #include "rbtree.h"
 #include "fault_alloc.h"
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -2177,6 +2178,148 @@ static void test_pool_destroy_with_populated_free_list(void) {
 }
 #endif
 
+/* ---- Mutation 3: large teardown on a 64 KB pthread stack (--stress N) ----
+ * Builds an N-node tree on the main thread, then runs only the operations
+ * under test -- rb_foreach (balanced shape) and rb_destroy -- on a thread
+ * whose stack is 64 KB, so any O(height) recursion over a deep tree overflows
+ * there. The tree is built outside the thread so a crash inside it can only
+ * be attributed to foreach/destroy. Balanced height is ~40 even at 10^6, which
+ * a recursive teardown survives; the left spine (height N) is the case that
+ * actually discriminates. Values are pointers into a hit-counter array and
+ * value_free increments the counter, so skipped, repeated and stray
+ * destructor calls are all exact without 10^6 value allocations. */
+#define STRESS_STACK_SIZE ((size_t)64 * 1024)
+#define STRESS_MAX_N      100000000ul
+
+static void stress_value_free(void *value) {
+    (*(unsigned *)value)++;
+}
+
+struct stress_job {
+    rbtree_t         *t;
+    bool              run_foreach;
+    struct sorted_ctx order;
+};
+
+static void *stress_thread(void *arg) {
+    struct stress_job *job = arg;
+    if (job->run_foreach) rb_foreach(job->t, check_sorted, &job->order);
+    rb_destroy(job->t);
+    return NULL;
+}
+
+static unsigned long gcd_ul(unsigned long a, unsigned long b) {
+    while (b != 0) { unsigned long r = a % b; a = b; b = r; }
+    return a;
+}
+
+static void stress_case(unsigned long n, bool left_spine) {
+    const char *shape = left_spine ? "left spine" : "balanced";
+    char desc[160];
+    unsigned *hits = calloc(n, sizeof *hits);
+    snprintf(desc, sizeof desc, "[stress %s] hit-counter array allocated", shape);
+    check(hits != NULL, desc);
+    if (hits == NULL) return;
+
+    /* Scrambled insertion order: a stride coprime to n permutes 0..n-1. */
+    unsigned long stride = 7919;
+    while (gcd_ul(stride, n) != 1) stride++;
+    rbtree_t *t = make_tree(stress_value_free);
+    int ok = t != NULL;
+    for (unsigned long i = 0; ok && i < n; i++) {
+        unsigned long k = (i * stride) % n;
+        char key[24];
+        snprintf(key, sizeof key, "k%07lu", k);
+        if (rb_insert(t, key, &hits[k]) != 0) ok = 0;
+    }
+    snprintf(desc, sizeof desc, "[stress %s] built %lu nodes on the main thread", shape, n);
+    check(ok && rb_size(t) == n, desc);
+    if (!ok) { rb_destroy(t); free(hits); return; }
+
+    if (left_spine) {
+#ifdef RBTREE_TEST_HOOKS
+        rb_test_make_spine(t, true);
+        snprintf(desc, sizeof desc, "[stress %s] all %lu nodes on one left spine", shape, n);
+        check(rb_test_spine_len(t, true) == n, desc);
+        snprintf(desc, sizeof desc, "[stress %s] parent links, order and size consistent", shape);
+        check(rb_test_links_ok(t), desc);
+#endif
+    } else {
+        snprintf(desc, sizeof desc, "[stress %s] tree is a valid red-black tree", shape);
+        check(rb_validate(t) == 0, desc);
+#ifdef RBTREE_TEST_HOOKS
+        snprintf(desc, sizeof desc, "[stress %s] parent links, order and size consistent", shape);
+        check(rb_test_links_ok(t), desc);
+#endif
+    }
+
+    /* Evening 8 adds rb_foreach on the left spine; the current recursive
+     * rb_foreach would overflow there, so tonight only destroy runs on it. */
+    struct stress_job job = { .t = t, .run_foreach = !left_spine,
+                              .order = { .prev = NULL, .count = 0, .sorted = 1 } };
+    pthread_attr_t attr;
+    size_t stack_size = 0;
+    int init_rc = pthread_attr_init(&attr);
+    int attr_rc = init_rc;
+    if (attr_rc == 0) attr_rc = pthread_attr_setstacksize(&attr, STRESS_STACK_SIZE);
+    if (attr_rc == 0) attr_rc = pthread_attr_getstacksize(&attr, &stack_size);
+    snprintf(desc, sizeof desc, "[stress %s] thread stack set to exactly 64 KB", shape);
+    check(attr_rc == 0 && stack_size == STRESS_STACK_SIZE, desc);
+
+    /* Armed on this thread before the worker exists; join orders the read. */
+    fault_alloc_arm(1);
+    pthread_t tid;
+    int create_rc = attr_rc == 0 ? pthread_create(&tid, &attr, stress_thread, &job) : -1;
+    int join_rc = create_rc == 0 ? pthread_join(tid, NULL) : -1;
+    snprintf(desc, sizeof desc, "[stress %s] worker thread created and joined", shape);
+    if (create_rc == 0 && join_rc != 0) {
+        /* A created-but-unjoined worker may still be using t, job, hits and
+         * the injector's counter, so nothing here can be safely read, freed
+         * or disarmed. Report and stop rather than race it. */
+        check(0, desc);
+        abort();
+    }
+    long allocs = fault_alloc_total();
+    fault_alloc_disarm();
+    if (init_rc == 0) pthread_attr_destroy(&attr);
+    check(create_rc == 0, desc);
+    if (create_rc != 0) rb_destroy(t); /* worker never ran; reclaim here */
+
+    snprintf(desc, sizeof desc, "[stress %s] foreach+destroy made no rb_malloc call", shape);
+    check(allocs == 0, desc);
+    if (!left_spine) {
+        snprintf(desc, sizeof desc, "[stress %s] foreach visited all %lu keys in order", shape, n);
+        check(job.order.count == n && job.order.sorted, desc);
+    }
+    unsigned long missed = 0, repeated = 0;
+    for (unsigned long i = 0; i < n; i++) {
+        if (hits[i] == 0) missed++;
+        else if (hits[i] > 1) repeated++;
+    }
+    snprintf(desc, sizeof desc,
+             "[stress %s] value_free once per node (missed %lu, repeated %lu)",
+             shape, missed, repeated);
+    check(missed == 0 && repeated == 0, desc);
+    free(hits);
+}
+
+static void run_stress(unsigned long n) {
+    make_tree  = rb_create;
+    mode_label = "heap";
+    stress_case(n, false);
+#ifdef RBTREE_TEST_HOOKS
+    stress_case(n, true);
+#endif
+    make_tree  = rb_create_pooled;
+    mode_label = "pooled";
+    stress_case(n, false);
+#ifdef RBTREE_TEST_HOOKS
+    stress_case(n, true);
+#endif
+    make_tree  = rb_create;
+    mode_label = NULL;
+}
+
 /* The semantic tree suite: every test whose claim is about tree BEHAVIOUR
  * rather than about a particular allocator's call sequence. Run once per
  * node-storage mode via make_tree. The two fault tests at the end belong here
@@ -2230,7 +2373,27 @@ static void run_tree_suite(void) {
     test_fault_sweep();
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    /* `--stress N` runs only the 64 KB-stack teardown cases and exits. */
+    if (argc > 1) {
+        char *end = NULL;
+        unsigned long n = argc == 3 && strcmp(argv[1], "--stress") == 0
+                              ? strtoul(argv[2], &end, 10) : 0;
+        if (n == 0 || n > STRESS_MAX_N || end == NULL || *end != '\0' ||
+            argv[2][0] == '-') {
+            fprintf(stderr, "usage: %s [--stress N]  (1 <= N <= %lu)\n", argv[0],
+                    STRESS_MAX_N);
+            return 2;
+        }
+        /* An overflow in the worker aborts the process without flushing
+         * stdout; line buffering keeps the PASS lines that name the case. */
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        run_stress(n);
+        if (failures == 0) printf("\nAll stress tests passed (N=%lu).\n", n);
+        else               printf("\n%d stress test(s) FAILED.\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
+
     /* Pass 1: ordinary rb_malloc node storage (the HW1 + M1 baseline). */
     make_tree  = rb_create;
     mode_label = "heap";
