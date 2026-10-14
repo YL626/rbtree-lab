@@ -565,6 +565,282 @@ static void test_destroy_spine(bool left, const char *shape) {
 
 static void test_destroy_left_spine(void)  { test_destroy_spine(true,  "left spine"); }
 static void test_destroy_right_spine(void) { test_destroy_spine(false, "right spine"); }
+
+/* ---- Mutation 3 (Evening 8): rb_foreach shape, order and restoration ----
+ * Keys live in the space k000..k199 and every value is make_int(k) for its
+ * own key number k, so the expected in-order sequence AND each key's value
+ * are known without consulting the tree. "Before" and "after" snapshots are
+ * taken with rb_find over the whole key space plus rb_size, rb_test_links_ok
+ * and either rb_validate (valid red-black shapes) or rb_test_spine_len
+ * (deliberately unbalanced spines, where rb_validate would rightly fail) --
+ * none of which is rb_foreach, so the walk under test never vouches for the
+ * tree it walked. These pass against the recursive rb_foreach too: they pin
+ * behaviour; the left-spine --stress case is what pins non-recursion. */
+#define FE_SPACE 200
+
+enum fe_kind { FE_RB, FE_LEFT_SPINE, FE_RIGHT_SPINE };
+
+struct fe_visit {
+    char   keys[FE_SPACE][24];
+    void  *vals[FE_SPACE];
+    int    hits[FE_SPACE]; /* indexed by key number, independent of visit order */
+    size_t count;
+    bool   overflow;
+};
+
+static void fe_collect(const char *key, void *value, void *ctx_ptr) {
+    struct fe_visit *v = ctx_ptr;
+    if (v->count >= FE_SPACE) { v->overflow = true; return; }
+    snprintf(v->keys[v->count], sizeof v->keys[0], "%s", key);
+    v->vals[v->count] = value;
+    long k = strtol(key + 1, NULL, 10);
+    if (k >= 0 && k < FE_SPACE) v->hits[k]++;
+    v->count++;
+}
+
+struct fe_state {
+    void  *vals[FE_SPACE]; /* rb_find(k) for every k in the space; NULL if absent */
+    size_t size;
+    bool   links_ok;
+    bool   shape_ok;       /* rb_validate == 0, or spine_len == size */
+};
+
+static void fe_capture(const rbtree_t *t, enum fe_kind kind, struct fe_state *s) {
+    for (int k = 0; k < FE_SPACE; k++) {
+        char key[24];
+        snprintf(key, sizeof key, "k%03d", k);
+        s->vals[k] = rb_find(t, key);
+    }
+    s->size = rb_size(t);
+    s->links_ok = rb_test_links_ok(t);
+    if (kind == FE_RB) s->shape_ok = rb_validate(t) == 0;
+    else s->shape_ok = rb_test_spine_len(t, kind == FE_LEFT_SPINE) == s->size;
+}
+
+/* Inserts k000..k(n-1) in the stride-37 scrambled order (coprime with every n
+ * used here), each with value make_int(k). */
+static rbtree_t *fe_build(int n, bool *present, const char *shape) {
+    char desc[128];
+    rbtree_t *t = make_tree(counting_free);
+    int ok = t != NULL;
+    for (int k = 0; k < FE_SPACE; k++) present[k] = false;
+    for (int i = 0; ok && i < n; i++) {
+        int k = (i * 37) % n;
+        char key[24];
+        snprintf(key, sizeof key, "k%03d", k);
+        int *v = make_int(k);
+        if (rb_insert(t, key, v) != 0) { free(v); ok = 0; }
+        else present[k] = true;
+    }
+    snprintf(desc, sizeof desc, "[foreach: %s] all %d inserts succeed", shape, n);
+    check(ok && rb_size(t) == (size_t)n, desc);
+    return t;
+}
+
+static void foreach_check_shape(rbtree_t *t, enum fe_kind kind, const bool *present,
+                                const char *shape) {
+    char desc[160];
+    size_t n = 0;
+    for (int k = 0; k < FE_SPACE; k++) n += present[k];
+
+    struct fe_state before = {0}, after = {0};
+    fe_capture(t, kind, &before);
+    snprintf(desc, sizeof desc, "[foreach: %s] before: rb_size == %zu", shape, n);
+    check(before.size == n, desc);
+    snprintf(desc, sizeof desc, "[foreach: %s] before: parent links, order and size consistent", shape);
+    check(before.links_ok, desc);
+    snprintf(desc, sizeof desc, kind == FE_RB ? "[foreach: %s] before: valid red-black tree"
+                                              : "[foreach: %s] before: all nodes on one spine", shape);
+    check(before.shape_ok, desc);
+    bool found_ok = true;
+    for (int k = 0; k < FE_SPACE; k++) {
+        if (present[k] ? before.vals[k] == NULL || *(int *)before.vals[k] != k
+                       : before.vals[k] != NULL) found_ok = false;
+    }
+    snprintf(desc, sizeof desc, "[foreach: %s] before: rb_find finds exactly the expected keys", shape);
+    check(found_ok, desc);
+
+    struct fe_visit first = {0}, second = {0};
+    fault_alloc_arm(1);
+    rb_foreach(t, fe_collect, &first);
+    long allocs = fault_alloc_total();
+    fault_alloc_disarm();
+    snprintf(desc, sizeof desc, "[foreach: %s] traversal makes no rb_malloc call", shape);
+    check(allocs == 0, desc);
+
+    /* Visited sequence vs the independently built expected one: same keys,
+     * same positions, and each key paired with the value stored under it. */
+    bool seq_ok = !first.overflow && first.count == n;
+    size_t pos = 0;
+    for (int k = 0; seq_ok && k < FE_SPACE; k++) {
+        if (!present[k]) continue;
+        char key[24];
+        snprintf(key, sizeof key, "k%03d", k);
+        if (strcmp(first.keys[pos], key) != 0 || first.vals[pos] != before.vals[k]) seq_ok = false;
+        pos++;
+    }
+    snprintf(desc, sizeof desc,
+             "[foreach: %s] visits the expected %zu keys in ascending order with their values",
+             shape, n);
+    check(seq_ok, desc);
+    bool once = true;
+    for (int k = 0; k < FE_SPACE; k++) {
+        if (first.hits[k] != (present[k] ? 1 : 0)) once = false;
+    }
+    snprintf(desc, sizeof desc, "[foreach: %s] every key visited exactly once", shape);
+    check(once, desc);
+    bool increasing = true;
+    for (size_t i = 1; i < first.count; i++) {
+        if (strcmp(first.keys[i - 1], first.keys[i]) >= 0) increasing = false;
+    }
+    snprintf(desc, sizeof desc, "[foreach: %s] callback keys strictly increasing under strcmp", shape);
+    check(increasing, desc);
+
+    /* Restoration: the tree after the walk is the tree before it. */
+    fe_capture(t, kind, &after);
+    snprintf(desc, sizeof desc, "[foreach: %s] after: rb_size unchanged", shape);
+    check(after.size == before.size, desc);
+    snprintf(desc, sizeof desc, "[foreach: %s] after: parent links, order and size consistent", shape);
+    check(after.links_ok, desc);
+    snprintf(desc, sizeof desc, kind == FE_RB ? "[foreach: %s] after: still a valid red-black tree"
+                                              : "[foreach: %s] after: still all nodes on one spine", shape);
+    check(after.shape_ok, desc);
+    snprintf(desc, sizeof desc, "[foreach: %s] after: rb_find returns the same value for every key", shape);
+    check(memcmp(before.vals, after.vals, sizeof before.vals) == 0, desc);
+
+    rb_foreach(t, fe_collect, &second);
+    bool same = !second.overflow && second.count == first.count;
+    for (size_t i = 0; same && i < first.count; i++) {
+        if (strcmp(first.keys[i], second.keys[i]) != 0 || first.vals[i] != second.vals[i]) same = false;
+    }
+    snprintf(desc, sizeof desc, "[foreach: %s] a second traversal yields the identical sequence", shape);
+    check(same, desc);
+}
+
+static void test_foreach_shape(int n, enum fe_kind kind, const char *shape) {
+    bool present[FE_SPACE];
+    free_count = 0;
+    rbtree_t *t = fe_build(n, present, shape);
+    if (kind != FE_RB) rb_test_make_spine(t, kind == FE_LEFT_SPINE);
+    foreach_check_shape(t, kind, present, shape);
+    rb_destroy(t);
+}
+
+static void test_foreach_empty(void)       { test_foreach_shape(0,   FE_RB,          "empty"); }
+static void test_foreach_single(void)      { test_foreach_shape(1,   FE_RB,          "single"); }
+static void test_foreach_balanced(void)    { test_foreach_shape(127, FE_RB,          "balanced"); }
+static void test_foreach_left_spine(void)  { test_foreach_shape(64,  FE_LEFT_SPINE,  "left spine"); }
+static void test_foreach_right_spine(void) { test_foreach_shape(64,  FE_RIGHT_SPINE, "right spine"); }
+
+/* Irregular: the same LCG insert/overwrite/delete mix as test_destroy_irregular,
+ * with present[] as the reference model of which keys survive. */
+static void test_foreach_irregular(void) {
+    bool present[FE_SPACE] = {false};
+    free_count = 0;
+    rbtree_t *t = make_tree(counting_free);
+    unsigned state = 12345u;
+    int ok = t != NULL;
+    for (int i = 0; ok && i < 600; i++) {
+        state = state * 1103515245u + 12345u;
+        int k = (int)((state >> 16) % (unsigned)FE_SPACE);
+        char key[24];
+        snprintf(key, sizeof key, "k%03d", k);
+        if (((state >> 8) & 3u) == 0) {
+            int rc = rb_delete(t, key);
+            if (rc != (present[k] ? 0 : -1)) ok = 0;
+            present[k] = false;
+        } else {
+            int *v = make_int(k);
+            if (rb_insert(t, key, v) != 0) { free(v); ok = 0; }
+            present[k] = true;
+        }
+    }
+    check(ok, "[foreach: irregular] every operation matches the reference model");
+    foreach_check_shape(t, FE_RB, present, "irregular");
+    rb_destroy(t);
+}
+
+/* Callback contract: read-only access to the tree being traversed is
+ * permitted. Each visit re-queries the tree -- rb_find of the visited key,
+ * rb_find of a key strictly between it and its successor (k005~ sorts after
+ * k005 and before k006; the probe a Morris-threaded tree would send around a
+ * cycle), rb_size, rb_validate on valid shapes, and a full nested
+ * rb_foreach -- and none of it may allocate or perturb the outer walk. */
+struct fe_reader {
+    const rbtree_t *t;
+    size_t          n;
+    size_t          count;
+    const char     *prev;
+    bool            validate;
+    bool            find_ok, absent_ok, size_ok, validate_ok, nested_ok, order_ok;
+};
+
+static void fe_count(const char *key, void *value, void *ctx_ptr) {
+    (void)key;
+    (void)value;
+    (*(size_t *)ctx_ptr)++;
+}
+
+static void fe_read(const char *key, void *value, void *ctx_ptr) {
+    struct fe_reader *r = ctx_ptr;
+    char probe[32];
+    if (rb_find(r->t, key) != value) r->find_ok = false;
+    snprintf(probe, sizeof probe, "%s~", key);
+    if (rb_find(r->t, probe) != NULL) r->absent_ok = false;
+    if (rb_size(r->t) != r->n) r->size_ok = false;
+    if (r->validate && rb_validate(r->t) != 0) r->validate_ok = false;
+    size_t nested = 0;
+    rb_foreach(r->t, fe_count, &nested);
+    if (nested != r->n) r->nested_ok = false;
+    if (r->prev != NULL && strcmp(r->prev, key) >= 0) r->order_ok = false;
+    r->prev = key;
+    r->count++;
+}
+
+static void test_foreach_read_only_callback(int n, enum fe_kind kind, const char *shape) {
+    char desc[160];
+    bool present[FE_SPACE];
+    free_count = 0;
+    rbtree_t *t = fe_build(n, present, shape);
+    if (kind != FE_RB) rb_test_make_spine(t, kind == FE_LEFT_SPINE);
+
+    struct fe_reader r = { .t = t, .n = (size_t)n, .count = 0, .prev = NULL,
+                           .validate = kind == FE_RB, .find_ok = true, .absent_ok = true,
+                           .size_ok = true, .validate_ok = true, .nested_ok = true,
+                           .order_ok = true };
+    fault_alloc_arm(1);
+    rb_foreach(t, fe_read, &r);
+    long allocs = fault_alloc_total();
+    fault_alloc_disarm();
+
+    snprintf(desc, sizeof desc, "[foreach callback: %s] outer walk visits all %d keys in order",
+             shape, n);
+    check(r.count == (size_t)n && r.order_ok, desc);
+    snprintf(desc, sizeof desc, "[foreach callback: %s] rb_find of the visited key returns its value", shape);
+    check(r.find_ok, desc);
+    snprintf(desc, sizeof desc, "[foreach callback: %s] rb_find of an in-between absent key returns NULL", shape);
+    check(r.absent_ok, desc);
+    snprintf(desc, sizeof desc, "[foreach callback: %s] rb_size unchanged inside the callback", shape);
+    check(r.size_ok, desc);
+    if (kind == FE_RB) {
+        snprintf(desc, sizeof desc, "[foreach callback: %s] rb_validate passes inside the callback", shape);
+        check(r.validate_ok, desc);
+    }
+    snprintf(desc, sizeof desc, "[foreach callback: %s] nested rb_foreach visits all %d keys", shape, n);
+    check(r.nested_ok, desc);
+    snprintf(desc, sizeof desc, "[foreach callback: %s] reads made no rb_malloc call", shape);
+    check(allocs == 0, desc);
+    snprintf(desc, sizeof desc, "[foreach callback: %s] after: parent links, order and size consistent", shape);
+    check(rb_test_links_ok(t), desc);
+    rb_destroy(t);
+}
+
+static void test_foreach_callback_balanced(void) {
+    test_foreach_read_only_callback(127, FE_RB, "balanced");
+}
+static void test_foreach_callback_left_spine(void) {
+    test_foreach_read_only_callback(64, FE_LEFT_SPINE, "left spine");
+}
 #endif
 
 /* ---- rb_delete: table-driven cases ----
@@ -765,6 +1041,13 @@ static void run_delete_case(const struct delete_case *c) {
 
     snprintf(msg, sizeof msg, "[%s] rb_validate passes after delete", c->name);
     check(rb_validate(t) == 0, msg);
+
+#ifdef RBTREE_TEST_HOOKS
+    /* rb_validate never reads parent pointers; the parent-pointer rb_foreach
+     * walk depends on every one transplant and the fixup rotations rewired. */
+    snprintf(msg, sizeof msg, "[%s] parent links, order and size consistent after delete", c->name);
+    check(rb_test_links_ok(t), msg);
+#endif
 
     snprintf(msg, sizeof msg, "[%s] deleted key %s no longer found", c->name, c->delete_key);
     check(rb_find(t, c->delete_key) == NULL, msg);
@@ -2364,6 +2647,14 @@ static void run_tree_suite(void) {
 #ifdef RBTREE_TEST_HOOKS
     test_destroy_left_spine();
     test_destroy_right_spine();
+    test_foreach_empty();
+    test_foreach_single();
+    test_foreach_balanced();
+    test_foreach_irregular();
+    test_foreach_left_spine();
+    test_foreach_right_spine();
+    test_foreach_callback_balanced();
+    test_foreach_callback_left_spine();
 #endif
     test_delete_table_driven();
     test_delete_missing_key_returns_error();
