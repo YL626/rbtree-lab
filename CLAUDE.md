@@ -70,8 +70,18 @@ never returns (longjmp, exit) leaves the tree valid because the walk never modif
 NULL-tolerance or thread-safety guarantee is added beyond the header.
 
 Still unimplemented: `rb_snapshot` (Mutation 4) only — optional and ungraded (see "The Reach"
-below). Still to do for HW2: the fresh-context adversarial review of the HW2 work and its
-PROMPTLOG episode, and the remaining REFLECTION.md items (see DEVLOG.md's latest OPEN list).
+below). The fresh-context HW2 hostile review ran on 2026-10-14 (DEVLOG.md): B1, an Appendix B
+include-path defect (`src/rbtree.c:2` and `src/pool.c:28` relied on `-Itests`), was reproduced and
+fixed in `750554e`; `pool_destroy` with live objects was a false positive (§8.2 permits it); the
+poisoning limitation (`key` holds the free-list link) is recorded, not a violation; and **A1 is
+unresolved**: the reviewer reproduced an ASan use-after-free in `rb_delete` (two-children case)
+when `value_free` re-entered the same tree through `rb_find`, and also flagged the overwrite
+path. Whether a destructor may re-enter the tree is an undecided contract question, so no fix is
+approved. The earlier concern about `value_free` re-entry during `rb_destroy` is separate and
+still undocumented. PROMPTLOG Episode 9 is finalized (`1d09840`) and REFLECTION.md is finalized
+(`93d01ae`). Still to do: recover the raw session transcripts from the desktop, inspect the
+Oct 12 M5 candidate for the required rejected-diff episode (unverified; PROMPTLOG has no
+Episode 10), run the final clean verification on the laptop, and build the submission archive.
 
 `tests/fuzz.c` runs insert/find/delete ops against a reference-model oracle (an array of
 key/value pairs), interleaving `rb_delete` per its later M2 commit. Its usage is now
@@ -121,7 +131,9 @@ mode), and four valgrind invocations each reporting "All heap blocks were
 freed" and 0 errors (the fourth is `test_rbtree --stress 20000`: 120,484 allocs/frees). The
 million-node case runs under ASan only; valgrind runs the 2×10^4 case — that shrink is
 deliberate and is stated in REFLECTION.md. HW1's baseline was the same gates green at
-2026-09-15 and M2's at 2026-10-08 (1897 assertions); nothing has regressed since.
+2026-09-15 and M2's at 2026-10-08 (1897 assertions); nothing has regressed since. The gates
+were reported green on the desktop again after `750554e` (5439 PASS, 0 valgrind errors); as of
+2026-10-14 they have not been re-run on the laptop.
 
 Coverage of the two-mode suite is a checked fact, not an inference: the heap pass emits 2390
 labelled assertions and the pooled pass 2366 (1374/1350 before Evening 8, 637/613 before
@@ -216,7 +228,9 @@ done — the spec requires zero findings across the whole suite, including the e
   defect, not a style nit. The seam exists so production allocation, the fault injector
   (`tests/fault_alloc.c`/`.h`), and the HW2 pool allocator (`src/pool.c`) can each sit
   underneath the tree interchangeably, without `rbtree.c`'s logic depending on which
-  implementation is currently active.
+  implementation is currently active. `src/` includes the injector header as
+  `"../tests/fault_alloc.h"` so Appendix B's `-Iinclude`-only build lines compile; do not rely
+  on the Makefile's `-Itests`.
 - **Allocation failure (HW2)**: any allocation may fail, and every call through the seam
   must be checked. Every failure path must unwind completely with no leaks — use the
   goto-cleanup pattern below. A failed operation must leave the tree in exactly the state it
