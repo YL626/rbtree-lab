@@ -25,7 +25,7 @@
  *     alignment padding, and objs_per_slab must be derived from what is left
  *     -- not from 4096, which is the off-by-one this file exists to get right.
  */
-#include "fault_alloc.h"
+#include "../tests/fault_alloc.h"
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
