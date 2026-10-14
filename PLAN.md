@@ -1,3 +1,51 @@
+# Handoff: current status (2026-10-14, after the HW2 hostile review)
+
+This is the current handoff. Everything below the horizontal rule is the historical `rb_delete`
+plan from M2, kept for the record.
+
+## Done this session
+- **HW2 hostile review run.** It was a fresh-context adversarial review against CS370-HW2.pdf
+  and the frozen header. Every gate was green at `4fba98b` when it ran.
+- **B1 fixed (`750554e`, "fix: resolve fault_alloc.h under Appendix B build flags").**
+  - The bug: `src/rbtree.c:2` and `src/pool.c:28` now include `"../tests/fault_alloc.h"`.
+    Before this, they only compiled because the Makefile adds `-Itests`. Appendix B's
+    `-Iinclude`-only build lines failed with `fault_alloc.h: No such file or directory`.
+  - Verified:
+    - both Appendix B lines compile warning-free;
+    - `make test`, `make asan`, `make stress-asan` and `make memcheck` pass from clean builds;
+    - the count is 5439 PASS, with 0 valgrind errors on all 4 runs;
+    - the diff is exactly 2 lines.
+- **Docs drafted, not final.** PROMPTLOG.md has episode 9, the hostile-review triage, marked
+  DRAFT. REFLECTION.md has an appended DRAFT section with the pool design decisions, the
+  `pool_stats` definitions, the poisoning rationale and the `kmem_cache` comparison.
+
+## Triage decisions (mine; do not re-litigate)
+| Finding | Decision |
+|---|---|
+| B1: include path vs Appendix B flags | **Genuine.** Fixed in `750554e`. |
+| `pool_destroy` with live objects | **False positive.** §8.2 allows destroy "regardless of how many objects are live". |
+| A1: reentrant `value_free` UAF (ASan, both modes) | Real UAF, **fix unapproved**. First decide whether destructor reentrancy is in contract. |
+| A2: poisoning never covers `key` (the link is at offset 0) | Limitation accepted. "Violates spec" rejected, since §8.2 anticipates the link replacing poisoned bytes. Goes in REFLECTION, not a fix. |
+| B2 (self-overwrite with same value ptr), B3 (`fault_alloc_total` semantics), B4 (NULL asserts in pool) | Not yet triaged. |
+| Gaps: small fault sweep, no tree-driven pool invariant, fuzzer never checks links/foreach | Legitimate. **Scope them before expanding anything.** |
+
+## Frozen without explicit approval
+`rb_delete`, `rb_insert`, `pool_free`, `pool_destroy`, the Makefile, and `include/rbtree.h`
+(always frozen).
+
+## Next steps, in order
+1. Rewrite PROMPTLOG episode 9 in my own words, then remove the DRAFT banner.
+2. Rewrite the REFLECTION DRAFT section in my own words, then trim the whole file to the 1–2 page
+   limit. It is about 1490 words now.
+3. Decide the A1 contract question. If reentrancy is out of contract, document it in the header
+   comment region of `src/rbtree.c` and in REFLECTION. If it is in contract, plan the fix and
+   get it approved first.
+4. Triage B2–B4, and scope the coverage gaps.
+5. Copy the session `.jsonl` transcripts into `transcripts/`, since they auto-purge after 30 days.
+6. Update the DEVLOG entry and the CLAUDE.md state lines for this session.
+
+---
+
 # rb_delete implementation plan (DRAFT — not yet approved)
 
 Status: awaiting approval. Nothing in `src/rbtree.c` has been modified. `tests/test_rbtree.c`

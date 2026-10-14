@@ -1,13 +1,13 @@
 # PROMPTLOG
 
-Trimmed to the 8 most substantive annotated episodes from a longer working log kept across the
+Trimmed to the 9 most substantive annotated episodes from a longer working log kept across the
 `rb_delete` (M2) milestone, its coverage-audit follow-up, an adversarial review session, the
 session that closed the gap that review found, HW2's Mutation 1 (allocation-failure fault
 injection), and Mutation 2 (the slab pool's design session and the pooled-tree integration that
-closed it). Each entry is: what I asked, what came back, and my judgment call — accepted,
+closed it), plus the HW2 hostile review (episode 9). Each entry is: what I asked, what came back, and my judgment call — accepted,
 revised, or rejected, and why. Corresponding commits: `71b55ac`, `f32e9ef`, `8fa9072`,
 `ddfdbf9`, `ff09cbb`, `7a6e2b7`, `a250531`, `a8f4439`, `febfdc2`, `d1ab2d2`, `0ebee46`,
-`21a44be`, `3d1afa9`, `36f82d1`.
+`21a44be`, `3d1afa9`, `36f82d1`, `750554e`.
 
 ---
 
@@ -453,6 +453,100 @@ whether work was *finished*, not about a diff's content — so this still is not
 oversized diff, and I am not counting it as one.
 
 ---
+
+---
+
+## 9. HW2 hostile review — a "plausible" build finding I upgraded to genuine, and a suspicion I named myself that the spec rules out
+
+> DRAFT (2026-10-14). The evidence and my verdicts below are final. The prose still needs a
+> pass in my own words before submission.
+
+**The prompt.** This was a fresh session with an adversarial review of all the HW2 work: the
+pooled tree, `src/pool.c`, the fault injector, and Mutation 3's teardown and traversal. I named
+the sources of truth as CS370-HW2.pdf and the frozen `include/rbtree.h`, and only those. The
+review had to cover slab geometry, poisoning, destruction and ownership, rollback, and
+plain-versus-pooled differences. It was not allowed to edit, fix, commit or fabricate, and it
+had to stop after the report. The report had five sections: A confirmed, B plausible,
+C dismissed, D coverage gaps, E fixes. I wrote the target list deliberately without
+pre-dismissing anything, and one of its lines was "pool_destroy called while live objects
+remain — whether any such path is legal under the actual API contract".
+
+**What came back.**
+- **Confirmed (A):**
+  - A1: a reentrant `value_free` that calls back into the tree hits a use-after-free. ASan
+    shows it in both modes.
+  - A2: 0xDD poisoning never covers the node's `key` field, because the free-list link occupies
+    offset 0.
+- **Plausible (B):**
+  - B1: a build defect.
+  - B2: a self-overwrite with the same value pointer.
+  - B3: the meaning of `fault_alloc_total`.
+  - B4: NULL asserts in the pool.
+- **Dismissed (C):** the reviewer investigated the `pool_destroy`-with-live-objects suspicion
+  and dismissed it.
+- **Coverage gaps (D):**
+  - a fault sweep that is too small;
+  - no tree-driven pool-invariant check;
+  - a fuzzer that never checks links or `rb_foreach`;
+  - the REFLECTION.md items still owed.
+
+Every gate (test, asan, stress-asan, memcheck) was green at `4fba98b` when the review ran.
+
+**Genuine finding: B1. I triaged it upward, and my reason differs from the reviewer's.**
+`src/rbtree.c:2` and `src/pool.c:28` both said `#include "fault_alloc.h"`. Our Makefile passes
+`-Itests`, so the header was found. The reviewer put this in B, "plausible". Its stated reasoning
+was an inference: the problem only matters *if* the grader builds with its own command line.
+I don't think that "if" is open. Appendix B of the spec documents the build line, and that line
+uses `-Iinclude` only. A tree that fails to compile under the spec's own documented flags is
+defective against the spec. That holds whatever the grader happens to do. I accepted B1 as
+genuine and asked for a plan first: reproduce, show the exact failing command, propose the
+minimum correction, and edit nothing yet.
+
+The reproduction was Appendix B's test-binary command, run from the repo root:
+`gcc -std=c23 -Wall -Wextra -Werror -g -O1 -Iinclude src/rbtree.c src/pool.c tests/test_rbtree.c tests/fault_alloc.c -o test_rbtree -lpthread`.
+It failed with two errors: `src/rbtree.c:2:10: fatal error: fault_alloc.h: No such file or
+directory` and the same error at `src/pool.c:28:10`. The fuzz line failed identically. The two
+`tests/` files that include the same header compile fine, because a quoted include searches the
+including file's own directory first, and the header is in `tests/`.
+
+The fix is two lines, `#include "../tests/fault_alloc.h"`. It was verified on a scratch copy
+before I approved it, then applied as `750554e`. Afterwards:
+- both Appendix B lines compile warning-free with no `-Itests`;
+- `make test`, `make asan`, `make stress-asan` and `make memcheck` all pass from clean builds;
+- the count is still 5439 PASS, so nothing silently dropped out;
+- valgrind reports 0 errors on all four runs;
+- `git diff --check` is clean, and the diff is exactly the two include lines.
+
+I deliberately left the Makefile's `-Itests` in place, because removing it isn't part of the fix.
+
+**False positive: `pool_destroy` with live objects.** This one came from me. I put it in the
+prompt because a pooled `rb_destroy` never calls `pool_free`, so the pool is always destroyed
+with `live > 0`. Out of context that looks like the classic "freed the allocator out from under
+its objects" bug. The reviewer investigated it and dismissed it. I checked that dismissal against
+the spec myself rather than taking it on trust. §8.2 says `pool_destroy` releases everything
+"regardless of how many objects are live". Destroying with live objects is the documented
+contract, not a tolerated edge case. Our design also only does it after the teardown walk has
+freed every key and owned value, which are the only things outside the slabs. The episode 8
+teardown decision already depended on this. So it is not a defect, and I am recording it as
+the false positive because the suspicion was reasonable on its face.
+
+**What I accepted only partly, and what I froze.**
+- **A2.** The limitation is real: a stale `key` reads as NULL or `""` rather than as 0xDD
+  garbage. I rejected the reviewer's framing that the link placement *violates* the spec.
+  §8.2 itself anticipates the free-list link overwriting part of the poisoned bytes. So this is
+  a REFLECTION.md item, not a fix.
+- **A1.** I accept the ASan reproduction as an observed use-after-free. I left the fix
+  unapproved because it turns on a contract question the header doesn't answer: is a
+  destructor allowed to re-enter the tree at all? `rb_delete`, `rb_insert`, `pool_free` and
+  `pool_destroy` are frozen until I decide that.
+- **The gaps (D).** They are legitimate, but I want them scoped before anything grows.
+
+**Judgment.** I accepted one finding as genuine, for my reason rather than the reviewer's
+inference. One suspicion was cleared against the spec text. One finding was partly accepted,
+and one fix was deliberately deferred. The pattern I'd flag is the reviewer's confidence labels.
+B1, the only finding that changed code, was filed as "plausible". A1, which ASan proves, may
+turn out to be out of contract. Severity labels from a review are an input to triage, not its
+result.
 
 ---
 
