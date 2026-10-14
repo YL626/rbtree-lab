@@ -458,9 +458,6 @@ oversized diff, and I am not counting it as one.
 
 ## 9. HW2 hostile review — a "plausible" build finding I upgraded to genuine, and a suspicion I named myself that the spec rules out
 
-> DRAFT (2026-10-14). The evidence and my verdicts below are final. The prose still needs a
-> pass in my own words before submission.
-
 **The prompt.** This was a fresh session with an adversarial review of all the HW2 work: the
 pooled tree, `src/pool.c`, the fault injector, and Mutation 3's teardown and traversal. I named
 the sources of truth as CS370-HW2.pdf and the frozen `include/rbtree.h`, and only those. The
@@ -488,7 +485,11 @@ remain — whether any such path is legal under the actual API contract".
   - a fault sweep that is too small;
   - no tree-driven pool-invariant check;
   - a fuzzer that never checks links or `rb_foreach`;
-  - the REFLECTION.md items still owed.
+  - D4: writes to freed pool slots may go undetected, because `pool_alloc` does not verify
+    poison integrity before reusing a slot;
+  - D5 (the reviewer's numbering): the REFLECTION.md items still owed, namely the poisoning
+    rationale, the `kmem_cache` comparison, the `pool_stats` definitions, the slab-header
+    decision and the alignment guarantee.
 
 Every gate (test, asan, stress-asan, memcheck) was green at `4fba98b` when the review ran.
 
@@ -496,13 +497,13 @@ Every gate (test, asan, stress-asan, memcheck) was green at `4fba98b` when the r
 `src/rbtree.c:2` and `src/pool.c:28` both said `#include "fault_alloc.h"`. Our Makefile passes
 `-Itests`, so the header was found. The reviewer put this in B, "plausible". Its stated reasoning
 was an inference: the problem only matters *if* the grader builds with its own command line.
-I don't think that "if" is open. Appendix B of the spec documents the build line, and that line
-uses `-Iinclude` only. A tree that fails to compile under the spec's own documented flags is
+I don't think that "if" is open. Appendix B's starter Makefile sets `CFLAGS` with `-Iinclude`
+only. A tree that fails to compile under the spec's own documented flags is
 defective against the spec. That holds whatever the grader happens to do. I accepted B1 as
 genuine and asked for a plan first: reproduce, show the exact failing command, propose the
 minimum correction, and edit nothing yet.
 
-The reproduction was Appendix B's test-binary command, run from the repo root:
+The reproduction was the expansion of Appendix B's recipe for the test binary, run from the repo root:
 `gcc -std=c23 -Wall -Wextra -Werror -g -O1 -Iinclude src/rbtree.c src/pool.c tests/test_rbtree.c tests/fault_alloc.c -o test_rbtree -lpthread`.
 It failed with two errors: `src/rbtree.c:2:10: fatal error: fault_alloc.h: No such file or
 directory` and the same error at `src/pool.c:28:10`. The fuzz line failed identically. The two
@@ -534,31 +535,55 @@ the false positive because the suspicion was reasonable on its face.
 - **A2.** The limitation is real: a stale `key` reads as NULL or `""` rather than as 0xDD
   garbage. I rejected the reviewer's framing that the link placement *violates* the spec.
   §8.2 itself anticipates the free-list link overwriting part of the poisoned bytes. So this is
-  a REFLECTION.md item, not a fix.
-- **A1.** I accept the ASan reproduction as an observed use-after-free. I left the fix
+  a REFLECTION.md item, not a fix. The reviewer classified A2 as a confirmed defect, so my
+  rejection of its asserted specification violation is a second example of a reviewer finding I
+  challenged. I am not saying the poisoning limitation itself does not exist.
+- **A1.** I accept the ASan reproduction as an observed use-after-free. The concern itself was
+  not new: DEVLOG.md had already recorded an undocumented `value_free` re-entry gap as an open
+  item in the Evening 7 and Evening 8 entries, and the hostile review supplied the ASan
+  reproduction. A1 is not fixed, and the contract question stays open. I left the fix
   unapproved because it turns on a contract question the header doesn't answer: is a
   destructor allowed to re-enter the tree at all? `rb_delete`, `rb_insert`, `pool_free` and
   `pool_destroy` are frozen until I decide that.
 - **The gaps (D).** They are legitimate, but I want them scoped before anything grows.
 
-**Judgment.** I accepted one finding as genuine, for my reason rather than the reviewer's
-inference. One suspicion was cleared against the spec text. One finding was partly accepted,
-and one fix was deliberately deferred. The pattern I'd flag is the reviewer's confidence labels.
-B1, the only finding that changed code, was filed as "plausible". A1, which ASan proves, may
-turn out to be out of contract. Severity labels from a review are an input to triage, not its
-result.
+**Judgment.** Each finding got a different outcome, and I want them kept distinct.
+- **B1:** a genuine build defect, which the reviewer labelled only "plausible". I reproduced it
+  independently against the spec's own build flags and fixed it in `750554e`.
+- **`pool_destroy` with live objects:** a suspicion I included in the review prompt myself. The
+  reviewer dismissed it, and I independently checked that dismissal against §8.2, which permits
+  it. It is a false positive.
+- **A2:** an actual poisoning limitation. I rejected the reviewer's classification of the link
+  placement as a specification defect, because §8.2 anticipates it. It is recorded in
+  REFLECTION.md and is not a fix.
+- **A1:** a use-after-free reproduced under ASan. Whether a destructor may re-enter the tree is a
+  contract question that is still unresolved, so the fix is unapproved and the code is frozen.
+- **Coverage gaps (D):** recorded so they can be scoped. Recording them does not authorize
+  implementing them.
+
+The pattern I'd flag is the reviewer's confidence labels. B1, the only finding that changed code,
+was filed as "plausible", while A1, which ASan proves, may turn out to be out of contract.
+Severity and confidence labels from a review are inputs to independent triage, not final
+judgments.
 
 ---
 
-## Note on process coverage: no rejected or oversized diff
+## Note on process coverage: no rejected or oversized diff confirmed yet
 
-This log has no "diff you rejected" episode, and that's a checked fact rather than an oversight.
-Every course-correction across M1/M2 (see Episodes 1 and 2 above) happened during planning or
-prose, before any test or implementation code existed to reject — the plan changed, not a diff
-that had already been written. When trimming this file, I asked Claude to search every local
-session transcript for this project (`~/.claude/projects/-home-rauld-cs370-rbtree-lab/*.jsonl`,
-not just the current conversation) for any moment a diff was sent back for being wrong or too
-large; nothing turned up. A separate, earlier session had independently run the same check on
-itself and reached the same conclusion beforehand. If a genuine rejected/oversized diff happens
-before submission, it belongs here on its own terms rather than retrofitted from a category that
+This log currently has no "diff you rejected" episode. That statement has two parts of different
+strength. The first is the historical Oct 8 audit: when I trimmed this file, I asked Claude to
+search every local session transcript for this project
+(`~/.claude/projects/-home-rauld-cs370-rbtree-lab/*.jsonl`, not just the current conversation) for
+any moment a diff was sent back for being wrong or too large, and nothing turned up. Every
+course-correction across M1/M2 (Episodes 1 to 8) happened during planning or prose, before any test
+or implementation code existed to reject. That audit predates Evening 7 (Oct 12), so it does not
+cover anything from that session or later.
+
+The second part is an open candidate. DEVLOG.md (Evening 7 entry) records that the first draft of
+the `rb_test_make_spine` hook returned its own spine length, that a "does nothing, returns n"
+mutant (M5) passed, and that the measuring moved into a separate `rb_test_spine_len`. DEVLOG's own
+open list labels this "(rejected diff)", but I have not yet checked the Oct 12 session transcript,
+so I do not know whether that draft was shown to me as a diff and sent back or was corrected by
+Claude on its own. Until that is checked, I am not counting it. If a genuine rejected or oversized
+diff is confirmed, it belongs here as its own episode rather than retrofitted from a category that
 doesn't apply.
