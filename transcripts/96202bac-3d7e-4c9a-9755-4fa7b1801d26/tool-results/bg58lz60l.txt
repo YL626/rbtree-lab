@@ -1,0 +1,683 @@
+     1	#include "rbtree.h"
+     2	#include "fault_alloc.h"
+     3	#include <stdio.h>
+     4	#include <stdbool.h>
+     5	#include <stdlib.h>
+     6	#include <string.h>
+     7	
+     8	/* Mutation 2 pool entry points, defined in src/pool.c. Declared here rather
+     9	 * than in a src/pool.h: the spec's file map is fixed, and tests/test_rbtree.c
+    10	 * already declares these the same way under RBTREE_TEST_HOOKS. rb_pool_t is
+    11	 * left INCOMPLETE on purpose -- the tree logic only ever holds a pointer, so
+    12	 * no pool layout is visible here and none can drift out of step. */
+    13	typedef struct rb_pool rb_pool_t;
+    14	extern rb_pool_t *pool_create(size_t obj_size);
+    15	extern void      *pool_alloc(rb_pool_t *p);
+    16	extern void       pool_free(rb_pool_t *p, void *obj);
+    17	extern void       pool_destroy(rb_pool_t *p);
+    18	
+    19	typedef enum { RED, BLACK } rb_color_t;
+    20	
+    21	struct rb_node {
+    22	    char           *key;
+    23	    void           *value;
+    24	    struct rb_node *parent;
+    25	    struct rb_node *left;
+    26	    struct rb_node *right;
+    27	    rb_color_t      color;
+    28	};
+    29	
+    30	struct rbtree {
+    31	    struct rb_node   *root;
+    32	    size_t            size;
+    33	    rb_value_free_fn  value_free;
+    34	    /* NULL => ordinary rb_malloc node storage; non-NULL => node storage drawn
+    35	     * from this slab pool. NULL *is* the mode discriminator: no flag, no
+    36	     * second struct, and every mode-dependent decision in this file is made
+    37	     * inside node_alloc/node_release and rb_destroy's teardown branch. */
+    38	    rb_pool_t        *pool;
+    39	};
+    40	
+    41	static bool is_red(const struct rb_node *n)  { return n != NULL && n->color == RED; }
+    42	static bool is_black(const struct rb_node *n) { return !is_red(n); }
+    43	
+    44	/* The single point where node storage is obtained and returned. Centralizing
+    45	 * them is what keeps rb_insert/rb_delete free of mode-specific branches: both
+    46	 * call these and neither knows which allocator is underneath.
+    47	 *
+    48	 * Only NODE storage is pooled. Key copies are variable-length and stay on the
+    49	 * rb_malloc/rb_free seam -- a fixed-stride slot pool cannot hold them.
+    50	 *
+    51	 * node_release is deliberately NOT used by rb_destroy's whole-tree teardown:
+    52	 * see the comment there. It exists for rb_delete and for rb_insert's rollback
+    53	 * when the key copy fails after a slot has already been taken. */
+    54	static struct rb_node *node_alloc(rbtree_t *t) {
+    55	    if (t->pool != NULL) return pool_alloc(t->pool);
+    56	    return rb_malloc(sizeof(struct rb_node));
+    57	}
+    58	
+    59	static void node_release(rbtree_t *t, struct rb_node *n) {
+    60	    if (t->pool != NULL) pool_free(t->pool, n);
+    61	    else                 rb_free(n);
+    62	}
+    63	
+    64	rbtree_t *rb_create(rb_value_free_fn value_free) {
+    65	    rbtree_t *t = rb_malloc(sizeof *t);
+    66	    if (t == NULL) return NULL;
+    67	    t->root = NULL;
+    68	    t->size = 0;
+    69	    t->value_free = value_free;
+    70	    t->pool = NULL;
+    71	    return t;
+    72	}
+    73	
+    74	/* Mutation 2: a tree whose NODES come from an internal slab pool. Everything
+    75	 * else -- the tree handle itself, and every key copy -- still goes through
+    76	 * rb_malloc, since neither is a fixed-size object the pool could hold.
+    77	 *
+    78	 * Two fallible steps, and the order is chosen so there is exactly one thing
+    79	 * to unwind: the handle first (nothing held if it fails), then the pool
+    80	 * (release the handle if it fails). pool_create is itself all-or-nothing --
+    81	 * it validates the geometry before its single rb_malloc -- so there is never
+    82	 * a half-built pool to dismantle, and no goto-cleanup ladder is warranted.
+    83	 *
+    84	 * rb_free(t) rather than rb_destroy(t) on the pool-create failure path: t is
+    85	 * an empty tree whose pool field rb_create has already set to NULL, so
+    86	 * rb_destroy would be correct, but rb_free says plainly that nothing has been
+    87	 * built yet and cannot be misread as teardown of a populated tree. */
+    88	rbtree_t *rb_create_pooled(rb_value_free_fn value_free) {
+    89	    rbtree_t *t = rb_create(value_free);
+    90	    if (t == NULL) return NULL;
+    91	
+    92	    t->pool = pool_create(sizeof(struct rb_node));
+    93	    if (t->pool == NULL) {
+    94	        rb_free(t);
+    95	        return NULL;
+    96	    }
+    97	    return t;
+    98	}
+    99	
+   100	void *rb_find(const rbtree_t *t, const char *key) {
+   101	    struct rb_node *cur = t->root;
+   102	    while (cur != NULL) {
+   103	        int cmp = strcmp(key, cur->key);
+   104	        if (cmp == 0) return cur->value;
+   105	        cur = (cmp < 0) ? cur->left : cur->right;
+   106	    }
+   107	    return NULL;
+   108	}
+   109	
+   110	/* Standard BST rotation, extended to keep parent pointers and t->root
+   111	 * correct — rotations own root maintenance, not rb_validate. */
+   112	static void rotate_left(rbtree_t *t, struct rb_node *x) {
+   113	    struct rb_node *y = x->right;
+   114	    x->right = y->left;
+   115	    if (y->left != NULL) y->left->parent = x;
+   116	    y->parent = x->parent;
+   117	    if (x->parent == NULL)        t->root = y;
+   118	    else if (x == x->parent->left) x->parent->left = y;
+   119	    else                            x->parent->right = y;
+   120	    y->left = x;
+   121	    x->parent = y;
+   122	}
+   123	
+   124	static void rotate_right(rbtree_t *t, struct rb_node *x) {
+   125	    struct rb_node *y = x->left;
+   126	    x->left = y->right;
+   127	    if (y->right != NULL) y->right->parent = x;
+   128	    y->parent = x->parent;
+   129	    if (x->parent == NULL)         t->root = y;
+   130	    else if (x == x->parent->right) x->parent->right = y;
+   131	    else                             x->parent->left = y;
+   132	    y->right = x;
+   133	    x->parent = y;
+   134	}
+   135	
+   136	static void insert_fixup(rbtree_t *t, struct rb_node *z) {
+   137	    /* Invariant: z is red. Loop while z's parent is also red (the only
+   138	     * possible violation after a plain BST insert of a red node). */
+   139	    while (is_red(z->parent)) {
+   140	        struct rb_node *parent = z->parent;
+   141	        struct rb_node *grandparent = parent->parent;
+   142	        if (parent == grandparent->left) {
+   143	            struct rb_node *uncle = grandparent->right;
+   144	            if (is_red(uncle)) {
+   145	                parent->color = BLACK;
+   146	                uncle->color = BLACK;
+   147	                grandparent->color = RED;
+   148	                z = grandparent;
+   149	            } else {
+   150	                if (z == parent->right) {
+   151	                    z = parent;
+   152	                    rotate_left(t, z);
+   153	                    parent = z->parent;
+   154	                }
+   155	                parent->color = BLACK;
+   156	                grandparent->color = RED;
+   157	                rotate_right(t, grandparent);
+   158	            }
+   159	        } else {
+   160	            struct rb_node *uncle = grandparent->left;
+   161	            if (is_red(uncle)) {
+   162	                parent->color = BLACK;
+   163	                uncle->color = BLACK;
+   164	                grandparent->color = RED;
+   165	                z = grandparent;
+   166	            } else {
+   167	                if (z == parent->left) {
+   168	                    z = parent;
+   169	                    rotate_right(t, z);
+   170	                    parent = z->parent;
+   171	                }
+   172	                parent->color = BLACK;
+   173	                grandparent->color = RED;
+   174	                rotate_left(t, grandparent);
+   175	            }
+   176	        }
+   177	    }
+   178	    t->root->color = BLACK;
+   179	}
+   180	
+   181	int rb_insert(rbtree_t *t, const char *key, void *value) {
+   182	    struct rb_node *parent = NULL;
+   183	    struct rb_node *cur = t->root;
+   184	    int cmp = 0;
+   185	    while (cur != NULL) {
+   186	        cmp = strcmp(key, cur->key);
+   187	        if (cmp == 0) {
+   188	            if (t->value_free) t->value_free(cur->value);
+   189	            cur->value = value;
+   190	            return 0;
+   191	        }
+   192	        parent = cur;
+   193	        cur = (cmp < 0) ? cur->left : cur->right;
+   194	    }
+   195	
+   196	    struct rb_node *n = node_alloc(t);
+   197	    if (n == NULL) return -1;
+   198	
+   199	    size_t keylen = strlen(key) + 1;
+   200	    n->key = rb_malloc(keylen);
+   201	    if (n->key == NULL) {
+   202	        /* Rollback: the slot goes straight back, so a pooled tree's
+   203	         * live + free_objs == slabs * objs_per_slab still holds across the
+   204	         * failure. n->value was never assigned and the caller still owns the
+   205	         * value it passed in. */
+   206	        node_release(t, n);
+   207	        return -1;
+   208	    }
+   209	    memcpy(n->key, key, keylen);
+   210	
+   211	    n->value = value;
+   212	    n->color = RED;
+   213	    n->left = n->right = NULL;
+   214	    n->parent = parent;
+   215	
+   216	    if (parent == NULL)      t->root = n;
+   217	    else if (cmp < 0)        parent->left = n;
+   218	    else                     parent->right = n;
+   219	
+   220	    insert_fixup(t, n);
+   221	    t->size++;
+   222	    return 0;
+   223	}
+   224	
+   225	static struct rb_node *find_node(const rbtree_t *t, const char *key) {
+   226	    struct rb_node *cur = t->root;
+   227	    while (cur != NULL) {
+   228	        int cmp = strcmp(key, cur->key);
+   229	        if (cmp == 0) return cur;
+   230	        cur = (cmp < 0) ? cur->left : cur->right;
+   231	    }
+   232	    return NULL;
+   233	}
+   234	
+   235	static struct rb_node *tree_min(struct rb_node *n) {
+   236	    while (n->left != NULL) n = n->left;
+   237	    return n;
+   238	}
+   239	
+   240	/* Puts v in u's slot (u->parent, or t->root) -- the only place delete
+   241	 * touches t->root or reparents a node, mirroring the rotations. */
+   242	static void transplant(rbtree_t *t, struct rb_node *u, struct rb_node *v) {
+   243	    if (v != NULL) v->parent = u->parent;
+   244	    if (u->parent == NULL)         t->root = v;
+   245	    else if (u == u->parent->left) u->parent->left = v;
+   246	    else                            u->parent->right = v;
+   247	}
+   248	
+   249	/* x may be NULL (NIL); since NULL can't carry its own parent pointer,
+   250	 * (parent, x) is threaded through the loop as an explicit pair instead
+   251	 * of ever reading x->parent -- see NOTES.md's devlog on why this tree
+   252	 * has no shared sentinel. */
+   253	static void delete_fixup(rbtree_t *t, struct rb_node *parent, struct rb_node *x) {
+   254	    while (parent != NULL && is_black(x)) {
+   255	        if (x == parent->left) {
+   256	            struct rb_node *sib = parent->right;
+   257	            if (is_red(sib)) {                     /* Case 5: sibling red */
+   258	                sib->color = BLACK;
+   259	                parent->color = RED;
+   260	                rotate_left(t, parent);
+   261	                sib = parent->right;
+   262	            }
+   263	            if (is_black(sib->left) && is_black(sib->right)) { /* Case 3: both nephews black */
+   264	                sib->color = RED;
+   265	                x = parent;
+   266	                parent = x->parent;
+   267	            } else {
+   268	                if (is_black(sib->right)) {         /* near red / far black: convert first */
+   269	                    if (sib->left != NULL) sib->left->color = BLACK;
+   270	                    sib->color = RED;
+   271	                    rotate_right(t, sib);
+   272	                    sib = parent->right;
+   273	                }
+   274	                sib->color = parent->color;         /* Case 4: far nephew red, terminal */
+   275	                parent->color = BLACK;
+   276	                if (sib->right != NULL) sib->right->color = BLACK;
+   277	                rotate_left(t, parent);
+   278	                return;
+   279	            }
+   280	        } else {
+   281	            /* exact mirror: left/right swapped, rotate_right/rotate_left swapped */
+   282	            struct rb_node *sib = parent->left;
+   283	            if (is_red(sib)) {
+   284	                sib->color = BLACK;
+   285	                parent->color = RED;
+   286	                rotate_right(t, parent);
+   287	                sib = parent->left;
+   288	            }
+   289	            if (is_black(sib->left) && is_black(sib->right)) {
+   290	                sib->color = RED;
+   291	                x = parent;
+   292	                parent = x->parent;
+   293	            } else {
+   294	                if (is_black(sib->left)) {
+   295	                    if (sib->right != NULL) sib->right->color = BLACK;
+   296	                    sib->color = RED;
+   297	                    rotate_left(t, sib);
+   298	                    sib = parent->left;
+   299	                }
+   300	                sib->color = parent->color;
+   301	                parent->color = BLACK;
+   302	                if (sib->left != NULL) sib->left->color = BLACK;
+   303	                rotate_right(t, parent);
+   304	                return;
+   305	            }
+   306	        }
+   307	    }
+   308	    if (x != NULL) x->color = BLACK;
+   309	}
+   310	
+   311	int rb_delete(rbtree_t *t, const char *key) {
+   312	    struct rb_node *z = find_node(t, key);
+   313	    if (z == NULL) return -1;
+   314	
+   315	    struct rb_node *n;
+   316	    bool free_own_payload = true;
+   317	
+   318	    if (z->left != NULL && z->right != NULL) {
+   319	        struct rb_node *y = tree_min(z->right);
+   320	        rb_free(z->key);
+   321	        if (t->value_free) t->value_free(z->value);
+   322	        z->key = y->key;
+   323	        z->value = y->value;
+   324	        n = y;
+   325	        free_own_payload = false;
+   326	    } else {
+   327	        n = z;
+   328	    }
+   329	
+   330	    struct rb_node *child = (n->left != NULL) ? n->left : n->right;
+   331	    bool n_was_black = is_black(n);
+   332	    transplant(t, n, child);
+   333	
+   334	    if (n_was_black) {
+   335	        if (child != NULL) {
+   336	            child->color = BLACK;             /* STEP1: absorbs the debt locally */
+   337	        } else {
+   338	            delete_fixup(t, n->parent, NULL); /* STEP2: only after transplant has run */
+   339	        }
+   340	    }
+   341	
+   342	    if (free_own_payload) {
+   343	        rb_free(n->key);
+   344	        if (t->value_free) t->value_free(n->value);
+   345	    }
+   346	    node_release(t, n);
+   347	    t->size--;
+   348	    return 0;
+   349	}
+   350	
+   351	size_t rb_size(const rbtree_t *t) {
+   352	    return t->size;
+   353	}
+   354	
+   355	/* In-order walk over parent pointers: no recursion, no allocation, two
+   356	 * pointers of state, and the tree is never written. Each edge is descended
+   357	 * once and climbed once, so the whole walk is O(n).
+   358	 *
+   359	 * Callback contract. fn may make read-only calls on this same tree
+   360	 * (rb_find, rb_size, rb_validate, a nested rb_foreach) and may do anything to
+   361	 * other trees. fn must not call rb_insert, rb_delete or rb_destroy on the tree
+   362	 * being traversed: the successor is read from the current node after fn
+   363	 * returns, and a rotation, a freed node or (for a two-children delete) a
+   364	 * freed successor would leave that read undefined. No mutating call is
+   365	 * supported, not even on the node just visited. Because the walk never
+   366	 * modifies the tree and holds no resources, a callback that never returns
+   367	 * (exit, longjmp) leaves the tree valid and fully usable. */
+   368	void rb_foreach(const rbtree_t *t,
+   369	                void (*fn)(const char *key, void *value, void *ctx), void *ctx) {
+   370	    const struct rb_node *cur = t->root;
+   371	    if (cur == NULL) return;
+   372	    while (cur->left != NULL) cur = cur->left;
+   373	    /* Invariant: exactly the keys < cur->key have been passed to fn, each once. */
+   374	    while (cur != NULL) {
+   375	        fn(cur->key, cur->value, ctx);
+   376	        if (cur->right != NULL) {
+   377	            /* Successor is the leftmost node of the right subtree. */
+   378	            cur = cur->right;
+   379	            while (cur->left != NULL) cur = cur->left;
+   380	        } else {
+   381	            /* Climb past every ancestor we reached from its right side; the
+   382	             * first one reached from the left is next, NULL means done. */
+   383	            const struct rb_node *child;
+   384	            do {
+   385	                child = cur;
+   386	                cur = cur->parent;
+   387	            } while (cur != NULL && child == cur->right);
+   388	        }
+   389	    }
+   390	}
+   391	
+   392	struct validate_state {
+   393	    const char *prev_key;
+   394	    bool        order_ok;
+   395	    size_t      count;
+   396	};
+   397	
+   398	static void validate_walk(const struct rb_node *n, struct validate_state *st) {
+   399	    if (n == NULL) return;
+   400	    validate_walk(n->left, st);
+   401	    if (st->prev_key != NULL && strcmp(st->prev_key, n->key) >= 0) {
+   402	        st->order_ok = false;
+   403	    }
+   404	    st->prev_key = n->key;
+   405	    st->count++;
+   406	    validate_walk(n->right, st);
+   407	}
+   408	
+   409	static bool has_red_red(const struct rb_node *n) {
+   410	    if (n == NULL) return false;
+   411	    if (is_red(n) && (is_red(n->left) || is_red(n->right))) return true;
+   412	    return has_red_red(n->left) || has_red_red(n->right);
+   413	}
+   414	
+   415	/* Returns the subtree's black-height, or -1 if any root-to-NIL path within it
+   416	 * has already been found to disagree with another. NULL (NIL) contributes a
+   417	 * black-height of 1 by convention; a black node adds 1 on top of its children's
+   418	 * (equal) black-height. */
+   419	static int black_height(const struct rb_node *n) {
+   420	    if (n == NULL) return 1;
+   421	    int lh = black_height(n->left);
+   422	    if (lh == -1) return -1;
+   423	    int rh = black_height(n->right);
+   424	    if (rh == -1) return -1;
+   425	    if (lh != rh) return -1;
+   426	    return lh + (is_black(n) ? 1 : 0);
+   427	}
+   428	
+   429	int rb_validate(const rbtree_t *t) {
+   430	    if (is_red(t->root)) {
+   431	        fprintf(stderr, "rb_validate: invariant 1 violated (root is red)\n");
+   432	        return 1;
+   433	    }
+   434	    if (has_red_red(t->root)) {
+   435	        fprintf(stderr, "rb_validate: invariant 2 violated "
+   436	                         "(a red node has a red child)\n");
+   437	        return 2;
+   438	    }
+   439	    if (black_height(t->root) == -1) {
+   440	        fprintf(stderr, "rb_validate: invariant 3 violated "
+   441	                         "(root-to-NIL paths have differing black-height)\n");
+   442	        return 3;
+   443	    }
+   444	
+   445	    struct validate_state st = { .prev_key = NULL, .order_ok = true, .count = 0 };
+   446	    validate_walk(t->root, &st);
+   447	
+   448	    if (!st.order_ok) {
+   449	        fprintf(stderr, "rb_validate: invariant 4 violated "
+   450	                         "(in-order keys not strictly increasing under strcmp)\n");
+   451	        return 4;
+   452	    }
+   453	    if (st.count != t->size) {
+   454	        fprintf(stderr, "rb_validate: invariant 5 violated "
+   455	                         "(rb_size=%zu, actual node count=%zu)\n", t->size, st.count);
+   456	        return 5;
+   457	    }
+   458	    return 0;
+   459	}
+   460	
+   461	/* Teardown. The right-spine "Reach" walk is unchanged; the only mode-dependent
+   462	 * part is who reclaims node storage.
+   463	 *
+   464	 * Ordinary tree: each node is rb_free'd as the walk drops it.
+   465	 *
+   466	 * Pooled tree: nodes are NOT individually pool_free'd. Whole-tree destruction
+   467	 * is exactly the case pool_destroy is for -- it releases every slab whether
+   468	 * its slots were live, free-listed, or never carved -- so per-node pool_free
+   469	 * would cost an O(n) pass of poisoning and free-list churn to hand slots back
+   470	 * to a pool that is about to cease existing. What the walk is still required
+   471	 * for is the payloads: keys and values live OUTSIDE the slabs and are not
+   472	 * reclaimed by pool_destroy, so every key and owned value must be freed while
+   473	 * its node is still readable.
+   474	 *
+   475	 * Hence the ordering, which is load-bearing in both modes:
+   476	 *   1. capture `next` before anything is released,
+   477	 *   2. free the key,
+   478	 *   3. invoke value_free,
+   479	 *   4. (ordinary only) rb_free the node,
+   480	 * then after the walk, pool_destroy and finally the handle. Step 1 matters
+   481	 * more under the pool than without it: a pooled node is still live slab memory
+   482	 * after teardown passes over it, so a stale read would be invisible to ASan
+   483	 * rather than a reported use-after-free. */
+   484	void rb_destroy(rbtree_t *t) {
+   485	    if (t == NULL) return;
+   486	    struct rb_node *cur = t->root;
+   487	    /* Invariant: cur reaches N unfreed nodes; 2*N-S decreases (S = right-spine length). */
+   488	    while (cur != NULL) {
+   489	        struct rb_node *next;
+   490	        if (cur->left == NULL) {
+   491	            next = cur->right;
+   492	            rb_free(cur->key);
+   493	            if (t->value_free) t->value_free(cur->value);
+   494	            if (t->pool == NULL) rb_free(cur); /* pooled: reclaimed wholesale below */
+   495	        } else {
+   496	            struct rb_node *left = cur->left;
+   497	            cur->left = left->right;
+   498	            left->right = cur;
+   499	            next = left; /* re-enter the loop rooted at the promoted node */
+   500	        }
+   501	        cur = next;
+   502	    }
+   503	    /* Last, and only after the walk: every node it traversed physically lives
+   504	     * inside a slab this releases. */
+   505	    if (t->pool != NULL) pool_destroy(t->pool);
+   506	    rb_free(t);
+   507	}
+   508	
+   509	#ifdef RBTREE_TEST_HOOKS
+   510	/* Test-only hooks for exercising rb_validate's negative paths (invariants
+   511	 * 1-5). Compiled in only when RBTREE_TEST_HOOKS is defined (test_rbtree's
+   512	 * build only, per the Makefile) so production/grading builds that compile
+   513	 * this file without the macro never see these symbols at all. Each hook
+   514	 * mutates only existing struct fields on nodes the tree already owns --
+   515	 * no allocation, no freeing -- so rb_destroy's pointer-only teardown walk
+   516	 * (left/right only; it never reads color, key contents, or t->size) stays
+   517	 * safe to call afterward regardless of which invariant was broken.
+   518	 *
+   519	 * rb_validate checks invariants in order (1: root black, 2: no red-red,
+   520	 * 3: black-height, 4: ordering, 5: size) and returns on the first failure,
+   521	 * which is what lets each hook below isolate its target invariant's return
+   522	 * code even when a mutation has a side effect on a later check. */
+   523	
+   524	/* Invariant 1: flip the root red. Root-color is checked first and
+   525	 * unconditionally, so this isolates invariant 1 regardless of anything
+   526	 * else about the tree. */
+   527	void rb_test_force_root_red(rbtree_t *t) {
+   528	    if (t != NULL && t->root != NULL) t->root->color = RED;
+   529	}
+   530	
+   531	/* Invariant 2: find a RED node with a real (non-NULL) BLACK child and flip
+   532	 * that child RED, producing a red-red pair. Returns 1 if found and
+   533	 * corrupted, 0 if the fixture didn't have the needed shape. */
+   534	static struct rb_node *find_red_with_black_child(struct rb_node *n) {
+   535	    if (n == NULL) return NULL;
+   536	    if (n->color == RED &&
+   537	        ((n->left != NULL && n->left->color == BLACK) ||
+   538	         (n->right != NULL && n->right->color == BLACK))) {
+   539	        return n;
+   540	    }
+   541	    struct rb_node *found = find_red_with_black_child(n->left);
+   542	    if (found != NULL) return found;
+   543	    return find_red_with_black_child(n->right);
+   544	}
+   545	
+   546	int rb_test_force_red_red(rbtree_t *t) {
+   547	    if (t == NULL) return 0;
+   548	    struct rb_node *p = find_red_with_black_child(t->root);
+   549	    if (p == NULL) return 0;
+   550	    struct rb_node *child = (p->left != NULL && p->left->color == BLACK)
+   551	                             ? p->left : p->right;
+   552	    child->color = RED;
+   553	    return 1;
+   554	}
+   555	
+   556	/* Invariant 3: find a non-root BLACK node whose parent is BLACK and whose
+   557	 * own children are both BLACK-or-NIL, then flip it RED. That perturbs only
+   558	 * that node's subtree's black count -- it can't create a red-red pair
+   559	 * (parent stays black, its own children stay black) and it doesn't touch
+   560	 * the root, so it isolates invariant 3 rather than tripping 1 or 2 first.
+   561	 * Returns 1 if found and corrupted, 0 otherwise. */
+   562	static struct rb_node *find_isolated_black_flip_target(struct rb_node *n) {
+   563	    if (n == NULL) return NULL;
+   564	    if (n->parent != NULL && n->color == BLACK && is_black(n->parent) &&
+   565	        is_black(n->left) && is_black(n->right)) {
+   566	        return n;
+   567	    }
+   568	    struct rb_node *found = find_isolated_black_flip_target(n->left);
+   569	    if (found != NULL) return found;
+   570	    return find_isolated_black_flip_target(n->right);
+   571	}
+   572	
+   573	int rb_test_break_black_height(rbtree_t *t) {
+   574	    if (t == NULL) return 0;
+   575	    struct rb_node *n = find_isolated_black_flip_target(t->root);
+   576	    if (n == NULL) return 0;
+   577	    n->color = RED;
+   578	    return 1;
+   579	}
+   580	
+   581	/* Invariant 4: swap the key pointers of two existing nodes (located by
+   582	 * their current key values), which breaks in-order strictly-increasing
+   583	 * order without touching allocation, color, or structure -- each string is
+   584	 * still owned by exactly one node afterward, just a different one. Returns
+   585	 * 1 if both keys were found and swapped, 0 otherwise. */
+   586	static struct rb_node *find_by_key(struct rb_node *n, const char *key) {
+   587	    while (n != NULL) {
+   588	        int cmp = strcmp(key, n->key);
+   589	        if (cmp == 0) return n;
+   590	        n = (cmp < 0) ? n->left : n->right;
+   591	    }
+   592	    return NULL;
+   593	}
+   594	
+   595	int rb_test_swap_keys(rbtree_t *t, const char *key1, const char *key2) {
+   596	    if (t == NULL) return 0;
+   597	    struct rb_node *n1 = find_by_key(t->root, key1);
+   598	    struct rb_node *n2 = find_by_key(t->root, key2);
+   599	    if (n1 == NULL || n2 == NULL || n1 == n2) return 0;
+   600	    char *tmp = n1->key;
+   601	    n1->key = n2->key;
+   602	    n2->key = tmp;
+   603	    return 1;
+   604	}
+   605	
+   606	/* Invariant 5: directly desync the size counter from the real node count,
+   607	 * touching nothing else. Works on any tree, even empty. */
+   608	void rb_test_bump_size(rbtree_t *t) {
+   609	    if (t != NULL) t->size += 1;
+   610	}
+   611	
+   612	/* Mutation 3: rb_insert/rb_delete keep height O(log n), so no public-API
+   613	 * sequence yields a deep tree, and a recursive teardown would pass every
+   614	 * balanced test. This reshapes an existing tree into a single spine (all
+   615	 * left children if `left`, else all right children) using the real
+   616	 * rotations, so parent pointers, t->root, t->size, in-order sequence and
+   617	 * ownership are all preserved; only colors become meaningless (rb_validate
+   618	 * will report invariant 1-3 failures afterward). Iterative, O(1) space, no
+   619	 * allocation. Verified separately by rb_test_spine_len, so the reshape never
+   620	 * vouches for itself. */
+   621	void rb_test_make_spine(rbtree_t *t, bool left) {
+   622	    if (t == NULL) return;
+   623	    struct rb_node *cur = t->root;
+   624	    /* Invariant: every node above cur has no child on the off-spine side. */
+   625	    while (cur != NULL) {
+   626	        struct rb_node *off = left ? cur->right : cur->left;
+   627	        if (off != NULL) {
+   628	            if (left) rotate_left(t, cur);
+   629	            else      rotate_right(t, cur);
+   630	            cur = off; /* off now occupies cur's old position */
+   631	        } else {
+   632	            cur = left ? cur->left : cur->right;
+   633	        }
+   634	    }
+   635	}
+   636	
+   637	/* Length of the path from the root following only left (or only right)
+   638	 * links. Equals rb_size exactly when the tree is a single spine. */
+   639	size_t rb_test_spine_len(const rbtree_t *t, bool left) {
+   640	    size_t len = 0;
+   641	    if (t == NULL) return 0;
+   642	    for (const struct rb_node *n = t->root; n != NULL; n = left ? n->left : n->right) len++;
+   643	    return len;
+   644	}
+   645	
+   646	/* Structural check rb_validate does not make: every child's parent pointer
+   647	 * names its actual parent, the root's is NULL, the in-order sequence is
+   648	 * strictly increasing, and the node count equals t->size. Iterative in-order
+   649	 * walk over parent pointers, O(1) space, so it is safe on a degenerate spine.
+   650	 * An upward step only ever follows a parent link that was verified on the way
+   651	 * down, so the walk never trusts a pointer it is checking. Returns true when
+   652	 * all of it holds. */
+   653	bool rb_test_links_ok(const rbtree_t *t) {
+   654	    if (t == NULL) return false;
+   655	    const struct rb_node *cur = t->root, *prev = NULL;
+   656	    size_t count = 0;
+   657	    if (cur == NULL) return t->size == 0;
+   658	    if (cur->parent != NULL) return false;
+   659	    while (cur->left != NULL) {
+   660	        if (cur->left->parent != cur) return false;
+   661	        cur = cur->left;
+   662	    }
+   663	    /* Invariant: cur is the in-order successor of prev, and every edge on
+   664	     * the path root..cur has had its child->parent link verified. */
+   665	    while (cur != NULL) {
+   666	        if (prev != NULL && strcmp(prev->key, cur->key) >= 0) return false;
+   667	        if (++count > t->size) return false; /* also bounds a corrupted cycle */
+   668	        prev = cur;
+   669	        if (cur->right != NULL) {
+   670	            if (cur->right->parent != cur) return false;
+   671	            cur = cur->right;
+   672	            while (cur->left != NULL) {
+   673	                if (cur->left->parent != cur) return false;
+   674	                cur = cur->left;
+   675	            }
+   676	        } else {
+   677	            while (cur->parent != NULL && cur == cur->parent->right) cur = cur->parent;
+   678	            cur = cur->parent;
+   679	        }
+   680	    }
+   681	    return count == t->size;
+   682	}
+   683	#endif
