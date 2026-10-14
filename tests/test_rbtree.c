@@ -2461,14 +2461,14 @@ static void test_pool_destroy_with_populated_free_list(void) {
 }
 #endif
 
-/* ---- Mutation 3: large teardown on a 64 KB pthread stack (--stress N) ----
+/* ---- Mutation 3: large traversal + teardown on a 64 KB pthread stack (--stress N) ----
  * Builds an N-node tree on the main thread, then runs only the operations
- * under test -- rb_foreach (balanced shape) and rb_destroy -- on a thread
+ * under test -- rb_foreach then rb_destroy, on every shape -- on a thread
  * whose stack is 64 KB, so any O(height) recursion over a deep tree overflows
  * there. The tree is built outside the thread so a crash inside it can only
  * be attributed to foreach/destroy. Balanced height is ~40 even at 10^6, which
- * a recursive teardown survives; the left spine (height N) is the case that
- * actually discriminates. Values are pointers into a hit-counter array and
+ * a recursive traversal or teardown survives; the left spine (height N) is the
+ * case that actually discriminates. Values are pointers into a hit-counter array and
  * value_free increments the counter, so skipped, repeated and stray
  * destructor calls are all exact without 10^6 value allocations. */
 #define STRESS_STACK_SIZE ((size_t)64 * 1024)
@@ -2480,13 +2480,12 @@ static void stress_value_free(void *value) {
 
 struct stress_job {
     rbtree_t         *t;
-    bool              run_foreach;
     struct sorted_ctx order;
 };
 
 static void *stress_thread(void *arg) {
     struct stress_job *job = arg;
-    if (job->run_foreach) rb_foreach(job->t, check_sorted, &job->order);
+    rb_foreach(job->t, check_sorted, &job->order);
     rb_destroy(job->t);
     return NULL;
 }
@@ -2536,9 +2535,9 @@ static void stress_case(unsigned long n, bool left_spine) {
 #endif
     }
 
-    /* Evening 8 adds rb_foreach on the left spine; the current recursive
-     * rb_foreach would overflow there, so tonight only destroy runs on it. */
-    struct stress_job job = { .t = t, .run_foreach = !left_spine,
+    /* rb_foreach runs on both shapes: the left spine is the case that a
+     * recursive traversal cannot survive on a 64 KB stack. */
+    struct stress_job job = { .t = t,
                               .order = { .prev = NULL, .count = 0, .sorted = 1 } };
     pthread_attr_t attr;
     size_t stack_size = 0;
@@ -2570,10 +2569,8 @@ static void stress_case(unsigned long n, bool left_spine) {
 
     snprintf(desc, sizeof desc, "[stress %s] foreach+destroy made no rb_malloc call", shape);
     check(allocs == 0, desc);
-    if (!left_spine) {
-        snprintf(desc, sizeof desc, "[stress %s] foreach visited all %lu keys in order", shape, n);
-        check(job.order.count == n && job.order.sorted, desc);
-    }
+    snprintf(desc, sizeof desc, "[stress %s] foreach visited all %lu keys in order", shape, n);
+    check(job.order.count == n && job.order.sorted, desc);
     unsigned long missed = 0, repeated = 0;
     for (unsigned long i = 0; i < n; i++) {
         if (hits[i] == 0) missed++;

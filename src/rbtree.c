@@ -352,17 +352,41 @@ size_t rb_size(const rbtree_t *t) {
     return t->size;
 }
 
-static void foreach_inorder(const struct rb_node *n,
-                             void (*fn)(const char *, void *, void *), void *ctx) {
-    if (n == NULL) return;
-    foreach_inorder(n->left, fn, ctx);
-    fn(n->key, n->value, ctx);
-    foreach_inorder(n->right, fn, ctx);
-}
-
+/* In-order walk over parent pointers: no recursion, no allocation, two
+ * pointers of state, and the tree is never written. Each edge is descended
+ * once and climbed once, so the whole walk is O(n).
+ *
+ * Callback contract. fn may make read-only calls on this same tree
+ * (rb_find, rb_size, rb_validate, a nested rb_foreach) and may do anything to
+ * other trees. fn must not call rb_insert, rb_delete or rb_destroy on the tree
+ * being traversed: the successor is read from the current node after fn
+ * returns, and a rotation, a freed node or (for a two-children delete) a
+ * freed successor would leave that read undefined. No mutating call is
+ * supported, not even on the node just visited. Because the walk never
+ * modifies the tree and holds no resources, a callback that never returns
+ * (exit, longjmp) leaves the tree valid and fully usable. */
 void rb_foreach(const rbtree_t *t,
                 void (*fn)(const char *key, void *value, void *ctx), void *ctx) {
-    foreach_inorder(t->root, fn, ctx);
+    const struct rb_node *cur = t->root;
+    if (cur == NULL) return;
+    while (cur->left != NULL) cur = cur->left;
+    /* Invariant: exactly the keys < cur->key have been passed to fn, each once. */
+    while (cur != NULL) {
+        fn(cur->key, cur->value, ctx);
+        if (cur->right != NULL) {
+            /* Successor is the leftmost node of the right subtree. */
+            cur = cur->right;
+            while (cur->left != NULL) cur = cur->left;
+        } else {
+            /* Climb past every ancestor we reached from its right side; the
+             * first one reached from the left is next, NULL means done. */
+            const struct rb_node *child;
+            do {
+                child = cur;
+                cur = cur->parent;
+            } while (cur != NULL && child == cur->right);
+        }
+    }
 }
 
 struct validate_state {
