@@ -478,6 +478,34 @@ it and having the tests recompute it would let a geometry bug cancel out of its 
 whether `pool_stats` tolerates NULL out-parameters; whether `pool_create` buys a slab eagerly
 or lazily; and what a `obj_size` too large to fit even once should do.
 
+DECIDED (2026-10-13, Mutation 3 traversal — Evening 8): **parent pointers, not Morris**, and
+the following `rb_foreach` callback contract. The frozen header says only "In-order. Mutation 3:
+O(1) auxiliary space, no recursion," so the contract lives in the comment above `rb_foreach` in
+`src/rbtree.c` and here.
+
+- **Allowed:** read-only operations on the same tree from inside the callback — `rb_find`,
+  `rb_size`, `rb_validate`, and a nested `rb_foreach` — and anything at all on *other* trees.
+- **Prohibited (undefined behaviour):** `rb_insert`, `rb_delete` or `rb_destroy` on the tree
+  being traversed. The walk reads the current node's `right`/`parent` links *after* the callback
+  returns, so a rotation, a freed node, or — for a two-children delete — a freed successor node
+  would make that read undefined. No "safe" mutating subset is promised, not even deleting the
+  key just visited.
+- **Callback that never returns** (longjmp out, or exit): the tree is left intact and fully
+  valid. The walk only ever *reads* the tree — it holds two pointers on its own stack frame, writes
+  no node field, allocates nothing and holds no resource — so there is nothing half-done to undo
+  when the walk is abandoned at any point. This is a consequence of the design, not a separate
+  guarantee. (Morris traversal fails exactly here: it threads temporary `right` links through
+  the tree and only removes them as the walk proceeds, so an abandoned walk leaves the tree
+  corrupt, and even a read-only `rb_find` for an absent key between a threaded node and its
+  successor can loop forever while the threads are in place.)
+- **Not added:** no NULL-tolerance for `t` or `fn` (the header promises NULL-safety for
+  `rb_destroy` only) and no thread-safety guarantee.
+
+Tested in both node-storage modes: `test_foreach_read_only_callback` exercises every allowed
+call from inside the callback, including the absent in-between `rb_find`; the shape tests check
+that a full walk leaves size, `rb_find` results, parent links and (on valid red-black shapes)
+`rb_validate` unchanged.
+
 
 ## Confusions
 “Why does pool reuse hide useafter-free from ASan?” “What

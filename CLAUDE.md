@@ -16,8 +16,8 @@ constraints that must not be violated — read it before writing any code here.
 
 Current state of `src/rbtree.c`: `rb_create`, the node/tree structs (with parent pointer),
 the `rb_malloc`/`rb_free` seam, `rb_find` (real BST search), `rb_size`, `rb_insert` (with
-rotations and insertion fixup, all cases + mirrors), `rb_foreach` (recursive in-order),
-`rb_validate` (all five invariants), and `rb_destroy` are implemented. `rb_destroy` already
+rotations and insertion fixup, all cases + mirrors), `rb_foreach` (iterative in-order walk
+over parent pointers), `rb_validate` (all five invariants), and `rb_destroy` are implemented. `rb_destroy` already
 uses the non-recursive "Reach" technique (rotate into a right spine while freeing) — see
 "The Reach" below; it is not just the ungraded future work it's described as there.
 **`rb_delete` is now implemented**, including `delete_fixup` (the doubly-black fixup loop,
@@ -48,23 +48,47 @@ never walks `live` down to zero, `live + free_objs == slabs * objs_per_slab` is 
 against a *tree-driven* pool — a node skipped by teardown is caught via its leaked key under
 valgrind, which is sound but indirect. There is deliberately no `rb_test_pool_stats` hook.
 
-Still unimplemented: `rb_snapshot` (Mutation 4) and Mutation 3's O(1)-auxiliary-space
-`rb_foreach` (currently recursive — HW1 §9 permitted that, HW2 §8.3 does not; Evening 8).
-Mutation 3's *teardown* half is done and verified (`45f8171`, `8c24b06`): `rb_destroy`'s
-existing right-spine loop was reviewed and left unchanged apart from its invariant comment, and
-is now covered by shape / ownership / no-allocation unit tests plus a 64 KB-pthread-stack
-stress harness (`--stress N`).
+**Mutation 3 is complete: both `rb_destroy` and `rb_foreach` meet its O(1)-auxiliary-space,
+no-recursion requirement.** The teardown half (`45f8171`, `8c24b06`): `rb_destroy`'s existing
+right-spine loop was reviewed and left unchanged apart from its invariant comment, and is
+covered by shape / ownership / no-allocation unit tests plus a 64 KB-pthread-stack stress
+harness (`--stress N`). The traversal half (Evening 8, `f2fe3a8` tests, `cf9eda5`
+implementation): the recursive `foreach_inorder` is gone; `rb_foreach` starts at the leftmost
+node and steps to each in-order successor — the leftmost node of the right subtree if there is
+one, otherwise the first ancestor reached from its left side (NULL ends the walk). State is two
+`const` node pointers, `-fstack-usage` reports a fixed frame (32 B at -O1/-O2, same as
+`rb_destroy`), there is no allocation, and the tree is never written; a nonempty walk makes
+exactly 2n−1 pointer moves (each edge down once and up once, plus the root's final step to
+NULL), measured on an instrumented scratch copy from n = 1 to 10^6. Parent pointers were chosen
+over Morris threading because Morris rewrites `right` links mid-walk: a callback's `rb_find`
+for an absent key between threaded neighbours would loop, and a callback that never returned
+would strand the threads. **Callback contract** (comment above `rb_foreach`; decision in
+NOTES.md): read-only calls on the same tree (`rb_find`, `rb_size`, `rb_validate`, nested
+`rb_foreach`) are allowed; `rb_insert`, `rb_delete` and `rb_destroy` on the tree being traversed
+are forbidden (undefined behaviour — no "safe" mutating subset is promised); a callback that
+never returns (longjmp, exit) leaves the tree valid because the walk never modifies it. No
+NULL-tolerance or thread-safety guarantee is added beyond the header.
+
+Still unimplemented: `rb_snapshot` (Mutation 4) only — optional and ungraded (see "The Reach"
+below). Still to do for HW2: the fresh-context adversarial review of the HW2 work and its
+PROMPTLOG episode, and the remaining REFLECTION.md items (see DEVLOG.md's latest OPEN list).
 
 `tests/fuzz.c` runs insert/find/delete ops against a reference-model oracle (an array of
 key/value pairs), interleaving `rb_delete` per its later M2 commit. Its usage is now
 `fuzz <op_count> [seed|-] [heap|pooled]` — the mode selects the constructor, and `-` keeps the
 default `time(NULL)` seeding so a mode can be passed positionally without pinning the seed. `tests/test_rbtree.c`
-covers insert/find (including overwrite and missing-key cases), foreach ordering, validate
+covers insert/find (including overwrite and missing-key cases), foreach (per mode:
+empty/single/balanced/irregular/left-spine/right-spine shapes, each checked against an
+independently formatted expected sequence for order, exactly-once visits, zero `rb_malloc`
+calls, and before/after restoration of size, `rb_find` results, parent links and — on valid
+shapes only, never spines — `rb_validate`; plus read-only callbacks that call `rb_find` on
+present and absent in-between keys, `rb_size`, `rb_validate` and a nested `rb_foreach`), validate
 (ascending/descending/scrambled/empty), the insertion-fixup rotation cases (LL/RR/LR/RL,
 red-uncle recolor), destroy (single node, chain, value_free-once; and, per mode,
 empty/single/balanced/irregular plus hook-built left and right spines, each asserting zero
 `rb_malloc` calls during teardown and an exact `value_free` count), and the table-driven
-`rb_delete` cases. This now spans 17 rows in `delete_cases[]`: the spec's required minimum
+`rb_delete` cases (each row also checks `rb_test_links_ok`, since `rb_validate` never reads
+parent pointers and `rb_foreach` now depends on them). This now spans 17 rows in `delete_cases[]`: the spec's required minimum
 (red leaf + mirror, black leaf with red sibling + mirror, two-children root/non-root,
 single-node root, black node with one red child + mirror — 9 rows) plus an M2 coverage-audit
 pass that pins every remaining named `delete_fixup` branch by construction rather than
@@ -84,22 +108,26 @@ existing ≥10^5-op coverage rather than forced into a table row — the spec's 
 requirement (below) does not name it, and its absence from the table is a scoped decision, not
 an oversight. See `PROMPTLOG.md` episode 2 for the full derivation-and-pushback record.
 
-As of 2026-10-12: `make test`, `make asan`, `make stress-asan` and `make memcheck` (each from a
-clean rebuild) all pass with zero findings — 3371 unit assertions in the default run (most of
-the growth since M2 is the `make_int` fixture check, which emits one PASS per owned value; the
-Mutation 3 tests themselves add 29 per mode), the `--stress 20000` harness (34 assertions)
-under test/asan, the fuzzer at 10^5 ops in *both* node-storage modes under test/asan and
-2×10^4 ops in both under valgrind, `--stress 1000000` under ASan/UBSan via `stress-asan`
-(34 assertions, ~6 s), and four valgrind invocations each reporting "All heap blocks were
+As of 2026-10-13 (`cf9eda5`): `make test`, `make asan`, `make stress-asan` and `make memcheck`
+(each from a clean rebuild) all pass with zero findings — 5403 unit assertions in the default
+run (most of the growth since M2 is the `make_int` fixture check, which emits one PASS per owned
+value; the Evening 7 teardown tests add 29 labelled assertions per mode and the Evening 8
+foreach work 118 more: 17 parent-link checks on the delete rows plus 101 foreach checks), 5439
+PASS in total under `make test`/`make asan` (the 5403 plus the `--stress 20000` harness's 36),
+the fuzzer at 10^5 ops in *both* node-storage modes under test/asan and 2×10^4 ops in both under
+valgrind, `--stress 1000000` under ASan/UBSan via `stress-asan` (36 assertions, ~6 s —
+including `rb_foreach` over a 10^6-node left spine on the 64 KB thread in both heap and pooled
+mode), and four valgrind invocations each reporting "All heap blocks were
 freed" and 0 errors (the fourth is `test_rbtree --stress 20000`: 120,484 allocs/frees). The
 million-node case runs under ASan only; valgrind runs the 2×10^4 case — that shrink is
-deliberate and must be stated in REFLECTION.md. HW1's baseline was the same gates green at
+deliberate and is stated in REFLECTION.md. HW1's baseline was the same gates green at
 2026-09-15 and M2's at 2026-10-08 (1897 assertions); nothing has regressed since.
 
-Coverage of the two-mode suite is a checked fact, not an inference: the heap pass emits 1374
-labelled assertions and the pooled pass 1350 (637/613 before Mutation 3), and diffing the two
-description sets with the sweep excluded is identical — all 1302 non-sweep tree assertions run
-in both modes, in the same order (565 before Mutation 3; both modes grew by exactly 737). The
+Coverage of the two-mode suite is a checked fact, not an inference: the heap pass emits 2390
+labelled assertions and the pooled pass 2366 (1374/1350 before Evening 8, 637/613 before
+Mutation 3), and diffing the two description sets with the sweep excluded is identical — all
+2318 non-sweep tree assertions run in both modes, in the same order (1302 before Evening 8, 565
+before Mutation 3; both modes grew by exactly 737 in Evening 7 and 1016 in Evening 8). The
 24-line delta is sweep arithmetic (heap allocates 1 + 3×2 = 7 and terminates at n = 8;
 pooled allocates 2 + 2 + 1 + 1 = 6 and terminates at n = 7), plus five `make_int`
 fixture checks firing from inside the sweep. If a future change makes those two counts move
@@ -110,7 +138,7 @@ not re-baselined.
 
 - `include/rbtree.h` — frozen public API / graded contract. Never edit.
 - `src/rbtree.c` — tree logic: allocation/ownership, rotations, insertion and deletion
-  fixups, `rb_validate`, teardown. All heap allocation here goes through the `rb_malloc`/
+  fixups, `rb_validate`, the parent-pointer `rb_foreach` walk, teardown. All heap allocation here goes through the `rb_malloc`/
   `rb_free` seam.
 - `src/pool.c` — HW2 slab pool implementation (backs `rb_create_pooled`); complete.
   `rb_pool_geometry` (stride, first-slot offset, slots per slab, tail slack) and the in-band
@@ -137,8 +165,8 @@ not re-baselined.
   claim — their pooled counterparts are separate tests. Pool-internal tests are not tree tests
   and stay outside the two-mode suite. When adding a tree test, use `make_tree`, not a
   constructor by name. `--stress N` runs *only* the Mutation 3 harness (heap and pooled ×
-  balanced and left spine): the tree is built on the main thread, then `rb_foreach` (balanced
-  only, until Evening 8) and `rb_destroy` run on a 64 KB pthread stack. Test hooks it relies on
+  balanced and left spine): the tree is built on the main thread, then `rb_foreach` and
+  `rb_destroy` both run on every case, on a 64 KB pthread stack. Test hooks it relies on
   (`RBTREE_TEST_HOOKS` only, never in `rbtree.h`): `rb_test_make_spine`, `rb_test_spine_len`,
   `rb_test_links_ok`.
 - `tests/fuzz.c` — randomized stress driver / reference-model (oracle) testing against a
@@ -222,7 +250,7 @@ done — the spec requires zero findings across the whole suite, including the e
 - **`rb_foreach` / `rb_destroy`**: HW1 §9 permitted recursion here; HW2 Mutation 3 (§8.3, and
   the frozen header's comments on both functions) does not: no recursion, no heap-allocated
   stack/queue, O(1) auxiliary space. `rb_destroy` meets this (right-spine teardown);
-  `rb_foreach` is still recursive (Evening 8). The constraint is stated for these two
+  `rb_foreach` meets it too (parent-pointer successor walk, Evening 8). The constraint is stated for these two
   functions only, not as a ban on recursion everywhere (e.g. `rb_validate`, the test hooks).
 - **`rb_validate` invariants** (must detect and report *which* invariant broke):
   1. root is black
